@@ -124,6 +124,16 @@ jobs:
               Write-Host "host alive at +480"
             }
             Stop-Process -Id $h2.Id -Force -ErrorAction SilentlyContinue
+            # v16: WER del Application log — Event 1000 nombra modulo y offset del
+            # crash del host (v15: exit 0xC0000409, STATUS_STACK_BUFFER_OVERRUN /
+            # violacion CFG, muerte en (0,30) s tras callback limpio).
+            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
+            if ($wer) {
+              foreach ($w in $wer) {
+                $msg = ($w.Message -replace "\\s+", " ")
+                Write-Host ("WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(360, $msg.Length)))
+              }
+            } else { Write-Host "WER none" }
             $evf = Join-Path $dir "hostev.txt"
             if (Test-Path $evf) { Write-Host ("HOSTEV: " + (Get-Content $evf -Raw)) } else { Write-Host "HOSTEV: ausente" }
             Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
