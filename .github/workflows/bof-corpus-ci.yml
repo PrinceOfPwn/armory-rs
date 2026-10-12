@@ -99,12 +99,20 @@ jobs:
             Write-Host "svc killed"
             # 3) host.exe carga posee.dll YA INYECTADA: el callback dispara, el sentinel
             #    ya no existe y el stub re-lanza svc.exe (revival por TLS callback).
+            #    v13: fixture viejo fallaba su propio init (entry void sin TRUE => err 1114,
+            #    host instantaneo): sonda revival a +25 s + lift de hostev.txt (el host
+            #    nuevo dead-dropea load/err al lado del exe) ANTES de limpiar el temp.
             $h2 = Start-Process -FilePath $host_exe.FullName -PassThru -WindowStyle Hidden
             Write-Host ("host pid=" + $h2.Id)
-            Start-Sleep -Seconds 480
+            Start-Sleep -Seconds 25
+            $rev = @(Get-Process svc -ErrorAction SilentlyContinue).Count
+            Write-Host ("revived svc count=" + $rev)
+            Start-Sleep -Seconds 455
             $alive2 = Get-Process -Id $h2.Id -ErrorAction SilentlyContinue
             if ($alive2) { Write-Host ("host alive, cpu=" + $alive2.CPU) } else { Write-Host "host ended" }
             Stop-Process -Id $h2.Id -Force -ErrorAction SilentlyContinue
+            $evf = Join-Path $dir "hostev.txt"
+            if (Test-Path $evf) { Write-Host ("HOSTEV: " + (Get-Content $evf -Raw)) } else { Write-Host "HOSTEV: ausente" }
             Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "tls step done"
             exit 0
