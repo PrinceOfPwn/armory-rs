@@ -102,14 +102,27 @@ jobs:
             #    v13: fixture viejo fallaba su propio init (entry void sin TRUE => err 1114,
             #    host instantaneo): sonda revival a +25 s + lift de hostev.txt (el host
             #    nuevo dead-dropea load/err al lado del exe) ANTES de limpiar el temp.
+            # v15: gap 5 s entre kill y host — si el v14 fallo por lag de teardown
+            # del evento sentinel (OpenEventA encontro el evento vivo y el stub
+            # NO relanzo), 5 s lo garantiza muerto. Si con gap revival sigue 0,
+            # el problema esta en el camino WinExec, no en el sentinel.
+            Start-Sleep -Seconds 5
             $h2 = Start-Process -FilePath $host_exe.FullName -PassThru -WindowStyle Hidden
             Write-Host ("host pid=" + $h2.Id)
             Start-Sleep -Seconds 25
             $rev = @(Get-Process svc -ErrorAction SilentlyContinue).Count
-            Write-Host ("revived svc count=" + $rev)
-            Start-Sleep -Seconds 455
-            $alive2 = Get-Process -Id $h2.Id -ErrorAction SilentlyContinue
-            if ($alive2) { Write-Host ("host alive, cpu=" + $alive2.CPU) } else { Write-Host "host ended" }
+            Write-Host ("revived svc count25=" + $rev)
+            Start-Sleep -Seconds 215
+            $rev2 = @(Get-Process svc -ErrorAction SilentlyContinue).Count
+            Write-Host ("revived svc count240=" + $rev2)
+            # v15: exit code del host captura crash (0xC0000005) vs salida limpia
+            $h2 | Wait-Process -Timeout 240 -ErrorAction SilentlyContinue
+            $h2.Refresh()
+            if ($h2.HasExited) {
+              Write-Host ("host exit=" + $h2.ExitCode)
+            } else {
+              Write-Host "host alive at +480"
+            }
             Stop-Process -Id $h2.Id -Force -ErrorAction SilentlyContinue
             $evf = Join-Path $dir "hostev.txt"
             if (Test-Path $evf) { Write-Host ("HOSTEV: " + (Get-Content $evf -Raw)) } else { Write-Host "HOSTEV: ausente" }
