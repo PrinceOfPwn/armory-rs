@@ -201,6 +201,14 @@ jobs:
                 Write-Host ("WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(240, $msg.Length)))
               }
             } else { Write-Host "WER none" }
+            # v5 diagnostico: la variante dbg del sello -03 escribe su traza a
+            # %TEMP%\wsrun.txt (boot, pulls, descifre, ops). El revivido ANEXA al
+            # mismo archivo — la traza muestra AMBOS procesos.
+            $wsrun = Join-Path $env:TEMP "wsrun.txt"
+            if (Test-Path $wsrun) {
+              Write-Host "---- wsrun.txt (primeras 150 lineas) ----"
+              Get-Content $wsrun -ErrorAction SilentlyContinue | Select-Object -First 150 | ForEach-Object { Write-Host ("WSRUN " + $_) }
+            } else { Write-Host "wsrun.txt ausente (dbg no arranco o TEMP distinto)" }
             Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "p5 step done"
             exit 0
