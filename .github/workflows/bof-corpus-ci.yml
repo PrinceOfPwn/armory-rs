@@ -27,7 +27,7 @@ on:
 jobs:
   bofrunner:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 85
     steps:
       - name: pipeline
         shell: pwsh
@@ -165,15 +165,19 @@ jobs:
             # externo (v1/v2: NO-REVIVAL + WER none con TerminateProcess). El agente
             # muere SOLO via op pfrash del tasking (write-volatile a NULL = AV no
             # manejada -> WER Event 1000 -> el RM relanza con la mascara). Espera
-            # pasiva de la muerte propia: hasta 600 s.
+            # pasiva de la muerte propia: hasta 2400 s (v11: el consumo del sobre
+            # esta atado a epocas legibles de la rotacion de anclas — gap peor ~3
+            # epocas = 900 s + jitter de vuelta; v10 midio consumo a +846 y c
+            # publicable +1161 -> su epoca legible cayo fuera de la vieja ventana
+            # de 600 s. Ventana de muerte v11: [START+400, START+2800]).
             $died = $false
-            for ($i = 0; $i -lt 80; $i++) {
-              Start-Sleep -Seconds 5
+            for ($i = 0; $i -lt 240; $i++) {
+              Start-Sleep -Seconds 10
               if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { $died = $true; break }
             }
             $killedAt = Get-Date
             if ($died) { Write-Host ("P5 CRASHED=" + $p.Id + " AT=" + $killedAt.ToString("HH:mm:ss")) }
-            else { Write-Host "P5 CRASH-TIMEOUT: proceso vivo tras 600 s de espera" }
+            else { Write-Host "P5 CRASH-TIMEOUT: proceso vivo tras 2400 s de espera" }
             # ventana de revival: muestreo cada 5 s hasta 200 s. pid nuevo del mismo
             # exe + CommandLine = la mascara hex de 48 chars (evidencia de proceso).
             $new = $null
@@ -188,15 +192,18 @@ jobs:
               Write-Host ("P5 NEWPID=" + $new.Id)
               $ci = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $new.Id)
               if ($ci.CommandLine) { Write-Host ("P5 CMDLINE=" + $ci.CommandLine) } else { Write-Host "P5 CMDLINE=none" }
-              # el revivido vive ~600 s: consume el pfrun-2 post-revival (reg=0 =
-              # registro VACIO = proceso DISTINTO al que registro) y responde por malla.
-              Start-Sleep -Seconds 300
+              # el revivido consume el pfrun post-revival (reg=0 = registro VACIO
+              # = proceso DISTINTO al que registro) y responde por malla. v11: 1200 s
+              # para alcanzar la siguiente epoca legible (<=900 s + jitter de vuelta).
+              Start-Sleep -Seconds 1200
               Write-Host ("P5 postrevival alive=" + @(Get-Process svc -ErrorAction SilentlyContinue).Count)
               Stop-Process -Name svc -Force -ErrorAction SilentlyContinue
             } else {
               Write-Host "P5 NO-REVIVAL"
             }
-            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 15 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddSeconds(-900) }
+            # v11: ventana -5400 s — con la cadena completa el crash puede caer
+            # ~3000 s antes de esta lectura; el filtro -900 lo dejaba fuera.
+            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 15 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddSeconds(-5400) }
             if ($wer) {
               foreach ($w in $wer) {
                 $msg = ($w.Message -replace "\s+", " ")
