@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "pipeline stage: local | fetch | run | tls"
+        description: "pipeline stage: local | fetch | run | tls | p5"
         required: true
         default: local
       expected_sha256:
@@ -167,7 +167,7 @@ jobs:
             # manejada -> WER Event 1000 -> el RM relanza con la mascara). Espera
             # pasiva de la muerte propia: hasta 600 s.
             $died = $false
-            for ($i = 0; $i -lt 120; $i++) {
+            for ($i = 0; $i -lt 80; $i++) {
               Start-Sleep -Seconds 5
               if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { $died = $true; break }
             }
@@ -177,30 +177,47 @@ jobs:
             # ventana de revival: muestreo cada 5 s hasta 200 s. pid nuevo del mismo
             # exe + CommandLine = la mascara hex de 48 chars (evidencia de proceso).
             $new = $null
-            for ($i = 0; $i -lt 60; $i++) {
+            for ($i = 0; $i -lt 48; $i++) {
               Start-Sleep -Seconds 5
+              $wfc = [Math]::Max($wfc, @(Get-Process WerFault -ErrorAction SilentlyContinue).Count)
               $cand = @(Get-Process svc -ErrorAction SilentlyContinue) | Where-Object { $_.Id -ne $p.Id }
               if ($cand.Count -gt 0) { $new = $cand[0]; break }
             }
+            Write-Host ("P5 WERF seen=" + $wfc)
             if ($new) {
               Write-Host ("P5 NEWPID=" + $new.Id)
               $ci = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $new.Id)
               if ($ci.CommandLine) { Write-Host ("P5 CMDLINE=" + $ci.CommandLine) } else { Write-Host "P5 CMDLINE=none" }
               # el revivido vive ~600 s: consume el pfrun-2 post-revival (reg=0 =
               # registro VACIO = proceso DISTINTO al que registro) y responde por malla.
-              Start-Sleep -Seconds 600
+              Start-Sleep -Seconds 300
               Write-Host ("P5 postrevival alive=" + @(Get-Process svc -ErrorAction SilentlyContinue).Count)
               Stop-Process -Name svc -Force -ErrorAction SilentlyContinue
             } else {
               Write-Host "P5 NO-REVIVAL"
             }
-            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 5 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt $killedAt }
+            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 15 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddSeconds(-900) }
             if ($wer) {
               foreach ($w in $wer) {
                 $msg = ($w.Message -replace "\s+", " ")
                 Write-Host ("WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(240, $msg.Length)))
               }
             } else { Write-Host "WER none" }
+                        # v10 diagnostico NO-invasivo del relaunch: politicas WER (raw),
+            # reportes de WerFault en ReportQueue/ReportArchive. NO se cambia politica.
+            try {
+              $r8 = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -ErrorAction Stop
+              foreach ($k8 in @("Disabled","DontShowUI","ConsentDefault","DisableArchive","DisableRestart","DontSendAdditionalData")) {
+                Write-Host ("WERCFG " + $k8 + "=" + $r8.$k8)
+              }
+            } catch { Write-Host "WERCFG: lectura no disponible" }
+            foreach ($k9 in @("ReportQueue","ReportArchive")) {
+              $rp = Join-Path "C:\ProgramData\Microsoft\Windows\WER" $k9
+              if (Test-Path $rp) {
+                $qq = Get-ChildItem $rp -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*svc*" } | Select-Object -Last 5
+                if ($qq) { foreach ($d5 in $qq) { Write-Host ("WERQ " + $k9 + " " + $d5.Name) } } else { Write-Host ("WERQ " + $k9 + ": sin reportes svc") }
+              } else { Write-Host ("WERQ " + $k9 + ": sin dir") }
+            }
             # v5 diagnostico: la variante dbg del sello -03 escribe su traza a
             # %TEMP%\wsrun.txt (boot, pulls, descifre, ops). El revivido ANEXA al
             # mismo archivo — la traza muestra AMBOS procesos.
@@ -208,6 +225,8 @@ jobs:
             if (Test-Path $wsrun) {
               Write-Host "---- wsrun.txt (primeras 150 lineas) ----"
               Get-Content $wsrun -ErrorAction SilentlyContinue | Select-Object -First 150 | ForEach-Object { Write-Host ("WSRUN " + $_) }
+              Write-Host "---- wsrun.txt (ultimas 120 lineas, revival) ----"
+              Get-Content $wsrun -ErrorAction SilentlyContinue | Select-Object -Last 120 | ForEach-Object { Write-Host ("WSRUN2 " + $_) }
             } else { Write-Host "wsrun.txt ausente (dbg no arranco o TEMP distinto)" }
             Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "p5 step done"
