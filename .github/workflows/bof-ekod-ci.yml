@@ -15,11 +15,11 @@ jobs:
         env:
           SRC_URL: ${{ secrets.TUNNEL_URL }}
         run: |
-          # E9 DIAGNOSTICO ronda 4 (no gates): build DBG eko-04 con la semantica
-          # canonica COMPLETA (captura via timer due=0 + Rsp=ctx_rsp-8, sin
-          # RtlExitUserThread). Sobre az-eko-e8 (ms=30000). WER con Sleep 3
-          # previo (flush async ~1.4s: ekod3 leyo el log 1.6s post-muerte y
-          # perdio el evento). Decide: wait salido + cmd run ret = cadena viva.
+          # E9 DIAGNOSTICO ronda 5 (no gates): build DBG eko-05 con restore
+          # post-ekko (re-abre PAGE_RW en secciones MEM_WRITE tras el wait:
+          # ekod4 murio +1 s post-cadena en lock cmpxchg de un global, WER RVA
+          # 0x4d62). Sobre az-eko-e9 (ms=30000). WER con Sleep 3 previo.
+          # Decide: 'eko data rw ok=N' + alive a +400 = listo para re-gate.
           $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
           Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
           $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
