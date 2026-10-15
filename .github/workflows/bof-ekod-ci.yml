@@ -15,74 +15,66 @@ jobs:
         env:
           SRC_URL: ${{ secrets.TUNNEL_URL }}
         run: |
-          if ($stage -eq 'ekod') {
-            # E9 DIAGNOSTICO (no gates): sampler con EXCEPCIONES impresas +
-            # watchdog de muerte del svc + WER del crash. Sobre az-eko-e2 (ms=30000).
-            $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
-            Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
-            $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-            Write-Host ("pack sha256=" + $h)
-            $want = "${{ inputs.expected_sha256 }}"
-            if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
-            $dir = Join-Path $env:RUNNER_TEMP "ekd"
-            Expand-Archive -Path $zip -DestinationPath $dir -Force
-            Remove-Item $zip -Force
-            $svc = Get-ChildItem $dir -Filter 'svc.exe' | Select-Object -First 1
-            if (-not $svc) { Write-Host "NO PACK PARTS"; exit 1 }
-            $p = Start-Process -FilePath $svc.FullName -PassThru -WindowStyle Hidden
-            Write-Host ("EKOD OLDPID=" + $p.Id + " start=" + (Get-Date).ToString('HH:mm:ss'))
-            $job = Start-Job -ScriptBlock {
-              param($targetPid)
-              Add-Type -MemberDefinition '[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool ReadProcessMemory(IntPtr h, UInt64 addr, byte[] buf, UIntPtr size, out UIntPtr read);' -Name 'EkoMr' -Namespace 'Winapi'
-              $okn = 0
-              for ($i = 0; $i -lt 130; $i++) {
-                try {
-                  $proc = Get-Process -Id $targetPid -ErrorAction Stop
-                  $base = [UInt64]$proc.Modules[0].BaseAddress
-                  $hnd = [Winapi.EkoMr]::OpenProcess(0x0410, $false, [UInt32]$targetPid)
-                  if ($hnd -eq [IntPtr]::Zero) {
-                    if ($i -lt 3) { Write-Output ("EKOD openfail gle=" + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+          # E9 DIAGNOSTICO (no gates): sampler con EXCEPCIONES impresas +
+          # watchdog de muerte del svc + WER del crash. Sobre az-eko-e2 (ms=30000).
+          $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
+          Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host ("pack sha256=" + $h)
+          $want = "${{ inputs.expected_sha256 }}"
+          if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
+          $dir = Join-Path $env:RUNNER_TEMP "ekd"
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Remove-Item $zip -Force
+          $svc = Get-ChildItem $dir -Filter 'svc.exe' | Select-Object -First 1
+          if (-not $svc) { Write-Host "NO PACK PARTS"; exit 1 }
+          $p = Start-Process -FilePath $svc.FullName -PassThru -WindowStyle Hidden
+          Write-Host ("EKOD OLDPID=" + $p.Id + " start=" + (Get-Date).ToString('HH:mm:ss'))
+          $job = Start-Job -ScriptBlock {
+            param($targetPid)
+            Add-Type -MemberDefinition '[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool ReadProcessMemory(IntPtr h, UInt64 addr, byte[] buf, UIntPtr size, out UIntPtr read);' -Name 'EkoMr' -Namespace 'Winapi'
+            $okn = 0
+            for ($i = 0; $i -lt 130; $i++) {
+              try {
+                $proc = Get-Process -Id $targetPid -ErrorAction Stop
+                $base = [UInt64]$proc.Modules[0].BaseAddress
+                $hnd = [Winapi.EkoMr]::OpenProcess(0x0410, $false, [UInt32]$targetPid)
+                if ($hnd -eq [IntPtr]::Zero) {
+                  if ($i -lt 3) { Write-Output ("EKOD openfail gle=" + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+                } else {
+                  $buf = New-Object byte[] 64
+                  $read = [System.UIntPtr]::Zero
+                  $sz = New-Object System.UIntPtr ([UInt64]64)
+                  $okr = [Winapi.EkoMr]::ReadProcessMemory($hnd, ($base + 0x1040), $buf, $sz, ([ref]$read))
+                  if ($okr) {
+                    $okn++
+                    $hx = ($buf | ForEach-Object { $_.ToString("x2") }) -join ''
+                    Write-Output ("EKOD SAMP {0} {1}" -f $i, $hx.Substring(0, 32))
                   } else {
-                    $buf = New-Object byte[] 64
-                    $read = [System.UIntPtr]::Zero
-                    $sz = New-Object System.UIntPtr ([UInt64]64)
-                    $okr = [Winapi.EkoMr]::ReadProcessMemory($hnd, ($base + 0x1040), $buf, $sz, ([ref]$read))
-                    if ($okr) {
-                      $okn++
-                      $hx = ($buf | ForEach-Object { $_.ToString("x2") }) -join ''
-                      Write-Output ("EKOD SAMP {0} {1}" -f $i, $hx.Substring(0, 32))
-                    } else {
-                      if ($i -lt 3) { Write-Output ("EKOD readfail gle=" + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
-                    }
-                  }
-                } catch {
-                  if ($i -le 2) { Write-Output ("EKOD EXC iter=" + $i + " " + $_.Exception.Message) }
-                }
-                try {
-                  if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
-                    Write-Output ("EKOD DEAD at iter " + $i + " time " + (Get-Date).ToString('HH:mm:ss.fff'))
-                    break
-                  }
-                } catch { }
-                Start-Sleep -Seconds 3
-              }
-              Write-Output ("EKOD job ok samples=" + $okn)
-            } -ArgumentList $p.Id
-            Start-Sleep -Seconds 400
-            Stop-Job $job -ErrorAction SilentlyContinue
-            $out = Receive-Job $job -ErrorAction SilentlyContinue
-            foreach ($l in $out) { Write-Host $l }
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
-            if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Write-Host "EKOD svc alive a +400" } else { Write-Host "EKOD svc dead a +400" }
-            $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
-            if ($wer) {
-              foreach ($w in $wer) {
-                $msg = ($w.Message -replace "\s+", " ")
-                Write-Host ("EKOD WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(400, $msg.Length)))
-              }
-            } else { Write-Host "EKOD WER none" }
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "ekod step done"
-            exit 0
-          }
+                    if ($i -lt 3) { Write-Output ("EKOD readfail gle=" + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+              } catch {
+                if ($i -le 2) { Write-Output ("EKOD EXC iter=" + $i + " " + $_.Exception.Message) }
+              try {
+                if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
+                  Write-Output ("EKOD DEAD at iter " + $i + " time " + (Get-Date).ToString('HH:mm:ss.fff'))
+                  break
+              } catch { }
+              Start-Sleep -Seconds 3
+            Write-Output ("EKOD job ok samples=" + $okn)
+          } -ArgumentList $p.Id
+          Start-Sleep -Seconds 400
+          Stop-Job $job -ErrorAction SilentlyContinue
+          $out = Receive-Job $job -ErrorAction SilentlyContinue
+          foreach ($l in $out) { Write-Host $l }
+          Remove-Job $job -Force -ErrorAction SilentlyContinue
+          if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Write-Host "EKOD svc alive a +400" } else { Write-Host "EKOD svc dead a +400" }
+          $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
+          if ($wer) {
+            foreach ($w in $wer) {
+              $msg = ($w.Message -replace "\s+", " ")
+              Write-Host ("EKOD WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(400, $msg.Length)))
+          } else { Write-Host "EKOD WER none" }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "ekod step done"
+          exit 0
