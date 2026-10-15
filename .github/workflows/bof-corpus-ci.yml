@@ -237,7 +237,7 @@ jobs:
               for ($i = 0; $i -lt 270; $i++) {
                 try {
                   $proc = Get-Process -Id $targetPid -ErrorAction Stop
-                  $base = [UInt64]$proc.Modules[0].BaseAddress
+                  $base = [UInt64]$proc.Modules[0].BaseAddress.ToInt64()
                   $hnd = [Winapi.EkoMr]::OpenProcess(0x0410, $false, [UInt32]$targetPid)
                   $buf = New-Object byte[] 64
                   $read = [System.UIntPtr]::Zero
