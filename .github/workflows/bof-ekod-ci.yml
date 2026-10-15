@@ -80,6 +80,14 @@ jobs:
               Write-Host ("EKOD WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(400, $msg.Length)))
             }
           } else { Write-Host "EKOD WER none" }
+          $ws = @($env:TEMP, $env:RUNNER_TEMP, $env:LOCALAPPDATA) | Where-Object { $_ }
+          foreach ($wdir in $ws) {
+            $cand = Get-ChildItem -Path $wdir -Recurse -Filter 'wsrun.txt' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2
+            foreach ($c in $cand) {
+              Write-Host ("EKOD TRACE " + $c.FullName)
+              Get-Content -Path $c.FullName -Tail 40 | ForEach-Object { Write-Host ("EKOD WS " + $_) }
+            }
+          }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "ekod step done"
