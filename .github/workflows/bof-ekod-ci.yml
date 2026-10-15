@@ -16,7 +16,7 @@ jobs:
           SRC_URL: ${{ secrets.TUNNEL_URL }}
         run: |
           # E9 DIAGNOSTICO (no gates): sampler con EXCEPCIONES impresas +
-          # watchdog de muerte del svc + WER del crash. Sobre az-eko-e2 (ms=30000).
+          # watchdog de muerte del svc + WER del crash. Sobre az-eko-e5 (ms=30000). Build DBG con traza dbg! (wsrun.txt).
           $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
           Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
           $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
