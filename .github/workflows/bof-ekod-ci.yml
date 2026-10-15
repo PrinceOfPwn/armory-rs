@@ -15,10 +15,11 @@ jobs:
         env:
           SRC_URL: ${{ secrets.TUNNEL_URL }}
         run: |
-          # E9 DIAGNOSTICO ronda 3 (no gates): sampler con EXCEPCIONES impresas +
-          # watchdog de muerte del svc + WER del crash. Sobre az-eko-e7 (ms=30000).
-          # Build DBG eko-03 CON fix WT_EXEC_IN_TIMER (traza dbg! en wsrun.txt):
-          # decide si la cadena sobrevive (wait salido + cmd run ret) o muere (WER offset).
+          # E9 DIAGNOSTICO ronda 4 (no gates): build DBG eko-04 con la semantica
+          # canonica COMPLETA (captura via timer due=0 + Rsp=ctx_rsp-8, sin
+          # RtlExitUserThread). Sobre az-eko-e8 (ms=30000). WER con Sleep 3
+          # previo (flush async ~1.4s: ekod3 leyo el log 1.6s post-muerte y
+          # perdio el evento). Decide: wait salido + cmd run ret = cadena viva.
           $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
           Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
           $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
@@ -75,6 +76,7 @@ jobs:
           foreach ($l in $out) { Write-Host $l }
           Remove-Job $job -Force -ErrorAction SilentlyContinue
           if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Write-Host "EKOD svc alive a +400" } else { Write-Host "EKOD svc dead a +400" }
+          Start-Sleep -Seconds 3
           $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
           if ($wer) {
             foreach ($w in $wer) {
