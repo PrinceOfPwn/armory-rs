@@ -84,4 +84,3 @@ jobs:
           Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "ekod step done"
           exit 0
-        }
