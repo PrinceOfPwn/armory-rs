@@ -52,14 +52,19 @@ jobs:
                     Write-Output ("EKOD SAMP {0} {1}" -f $i, $hx.Substring(0, 32))
                   } else {
                     if ($i -lt 3) { Write-Output ("EKOD readfail gle=" + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+                  }
+                }
               } catch {
                 if ($i -le 2) { Write-Output ("EKOD EXC iter=" + $i + " " + $_.Exception.Message) }
+              }
               try {
                 if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
                   Write-Output ("EKOD DEAD at iter " + $i + " time " + (Get-Date).ToString('HH:mm:ss.fff'))
                   break
+                }
               } catch { }
               Start-Sleep -Seconds 3
+            }
             Write-Output ("EKOD job ok samples=" + $okn)
           } -ArgumentList $p.Id
           Start-Sleep -Seconds 400
@@ -73,8 +78,10 @@ jobs:
             foreach ($w in $wer) {
               $msg = ($w.Message -replace "\s+", " ")
               Write-Host ("EKOD WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(400, $msg.Length)))
+            }
           } else { Write-Host "EKOD WER none" }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "ekod step done"
           exit 0
+        }
