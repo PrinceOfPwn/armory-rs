@@ -216,6 +216,8 @@ jobs:
             # VEREDICTO (driver fuera del runner): existe muestra MID != PRE
             # durante el ekko (imagen cifrada vista desde afuera), el agente
             # contesta con POST == PRE (restauracion byte-exacta) y sigue vivo.
+            # v14: sin here-string (pwsh exige el terminador en columna 0 y el
+            # bloque YAML lo indenta => ParserError; Add-Type -MemberDefinition).
             $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
             Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
             $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
@@ -231,25 +233,16 @@ jobs:
             Write-Host ("EKO OLDPID=" + $p.Id)
             $job = Start-Job -ScriptBlock {
               param($targetPid)
-              Add-Type -TypeDefinition @"
-              using System;
-              using System.Runtime.InteropServices;
-              public class EkoMr {
-                [DllImport("kernel32.dll", SetLastError=true)]
-                public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-                [DllImport("kernel32.dll", SetLastError=true)]
-                public static extern bool ReadProcessMemory(IntPtr h, UInt64 addr, byte[] buf, UIntPtr size, out UIntPtr read);
-              }
-              "@
+              Add-Type -MemberDefinition '[DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool ReadProcessMemory(IntPtr h, UInt64 addr, byte[] buf, UIntPtr size, out UIntPtr read);' -Name 'EkoMr' -Namespace 'Winapi'
               for ($i = 0; $i -lt 270; $i++) {
                 try {
                   $proc = Get-Process -Id $targetPid -ErrorAction Stop
                   $base = [UInt64]$proc.Modules[0].BaseAddress
-                  $hnd = [EkoMr]::OpenProcess(0x0410, $false, [UInt32]$targetPid)
+                  $hnd = [Winapi.EkoMr]::OpenProcess(0x0410, $false, [UInt32]$targetPid)
                   $buf = New-Object byte[] 64
                   $read = [System.UIntPtr]::Zero
                   $sz = New-Object System.UIntPtr ([UInt64]64)
-                  if ($hnd -ne [IntPtr]::Zero -and [EkoMr]::ReadProcessMemory($hnd, ($base + 0x1040), $buf, $sz, ([ref]$read))) {
+                  if ($hnd -ne [IntPtr]::Zero -and [Winapi.EkoMr]::ReadProcessMemory($hnd, ($base + 0x1040), $buf, $sz, ([ref]$read))) {
                     $hx = ($buf | ForEach-Object { $_.ToString("x2") }) -join ''
                     Write-Output ("EKO SAMP {0} {1}" -f $i, $hx)
                   }
