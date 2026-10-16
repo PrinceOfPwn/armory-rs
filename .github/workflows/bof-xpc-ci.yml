@@ -1,0 +1,68 @@
+name: bof-xpc-ci
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha256:
+        description: 'pack sha256 fail-closed'
+        default: ''
+jobs:
+  bofrunner:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: xpcstage
+        shell: pwsh
+        env:
+          SRC_URL: ${{ secrets.TUNNEL_URL }}
+        run: |
+          # E10 xproc.rs (cross-process x5+1 TASKING-ONLY: nunca automatica):
+          # build xpc-01. Sobres az-xpc1..6 (ctype xproc, op probar, tec
+          # mi/eb/ec/ph/wt/nc). Cada tecnica crea UN hijo notepad.exe propio,
+          # entrega el testigo (canary 0x1337 en RW remota), lo sondea por
+          # relectura, mide blk (query 52/8) y tree (walk conhost), y mata al
+          # hijo. Informe [xpc] tec st can pid blk tree SOLO por malla; este
+          # stage prueba vida + evidencia WER.
+          $zip = Join-Path $env:RUNNER_TEMP "pack.zip"
+          Invoke-WebRequest -Uri $env:SRC_URL -OutFile $zip -UseBasicParsing
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host ("pack sha256=" + $h)
+          $want = "${{ inputs.expected_sha256 }}"
+          if ($want -and ($h -ne $want.ToLower())) { Write-Host "SHA MISMATCH"; exit 1 }
+          $dir = Join-Path $env:RUNNER_TEMP "xpcd"
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Remove-Item $zip -Force
+          $svc = Get-ChildItem $dir -Filter 'svc.exe' | Select-Object -First 1
+          if (-not $svc) { Write-Host "NO PACK PARTS"; exit 1 }
+          $p = Start-Process -FilePath $svc.FullName -PassThru -WindowStyle Hidden
+          Write-Host ("TG OLDPID=" + $p.Id + " start=" + (Get-Date).ToString('HH:mm:ss'))
+          for ($i = 1; $i -le 13; $i++) {
+            Start-Sleep -Seconds 30
+            $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+            if ($alive) {
+              Write-Host ("TG alive " + $i + " t=" + (Get-Date).ToString('HH:mm:ss'))
+            } else {
+              Write-Host ("TG DEAD at t+" + ($i * 30) + "s")
+              break
+            }
+          }
+          if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { Write-Host "TG svc alive a +400" } else { Write-Host "TG svc dead a +400" }
+          Start-Sleep -Seconds 3
+          $wer = Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2} -MaxEvents 10 -ErrorAction SilentlyContinue
+          if ($wer) {
+            foreach ($w in $wer) {
+              $msg = ($w.Message -replace "\s+", " ")
+              Write-Host ("TG WER " + $w.TimeCreated.ToString("HH:mm:ss.fff") + ": " + $msg.Substring(0, [Math]::Min(400, $msg.Length)))
+            }
+          } else { Write-Host "TG WER none" }
+          $ws = @($env:TEMP, $env:RUNNER_TEMP, $env:LOCALAPPDATA) | Where-Object { $_ }
+          foreach ($wdir in $ws) {
+            $cand = Get-ChildItem -Path $wdir -Recurse -Filter 'wsrun.txt' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2
+            foreach ($c in $cand) {
+              Write-Host ("TG TRACE " + $c.FullName)
+              Get-Content -Path $c.FullName -Tail 40 | ForEach-Object { Write-Host ("TG WS " + $_) }
+            }
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "xpc step done"
+          exit 0
