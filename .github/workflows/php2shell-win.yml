@@ -28,8 +28,13 @@ jobs:
         shell: pwsh
         run: |
           $conf = "C:\xampp\apache\conf\httpd.conf"
+          $fix = { param($f) (Get-Content $f) -replace '"(/xampp/)', '"C:$1' | ForEach-Object { $_ -replace '"(\\xampp\\)', '"C:$1' } | Set-Content $f -Encoding ascii }
+          & $fix $conf
+          $xconf = "C:\xampp\apache\conf\extra\httpd-xampp.conf"
+          if (Test-Path $xconf) { & $fix $xconf }
           (Get-Content $conf) -replace '^Listen 80\s*$', 'Listen 127.0.0.1:8085' | Set-Content $conf -Encoding ascii
           (Get-Content $conf) -replace '^\s*Include conf/extra/httpd-ssl.conf', '#Include conf/extra/httpd-ssl.conf' | Set-Content $conf -Encoding ascii
+          Select-String -Path $conf -Pattern '^ServerRoot|^LoadModule php|^PHPIniDir|^DocumentRoot' | ForEach-Object { Write-Host ("paths: " + $_.Line) }
           Select-String -Path $conf -Pattern '^Listen|^#?Include conf/extra/httpd-ssl' | ForEach-Object { Write-Host ("conf: " + $_.Line) }
           $ini = "C:\xampp\php\php.ini"
           (Get-Content $ini) -replace '^memory_limit\s*=.*', 'memory_limit = 128M' |
