@@ -43,12 +43,12 @@ def hist(dec):
     return total, mod, low
 
 ARMS = [
-    ("d57b30k", ["--parts", "1800", "--depth", "57", "--big-len", "30000", "--burners", "4"]),
-    ("d57b34k", ["--parts", "1800", "--depth", "57", "--big-len", "34000", "--burners", "4"]),
-    ("d58b24k", ["--parts", "1800", "--depth", "58", "--big-len", "24000", "--burners", "4"]),
-    ("d58b30k", ["--parts", "1800", "--depth", "58", "--big-len", "30000", "--burners", "4"]),
-    ("d60b12k", ["--parts", "1800", "--depth", "60", "--big-len", "12000", "--burners", "4"]),
-    ("d62b8k", ["--parts", "1800", "--depth", "62", "--burners", "4"]),
+    ("d55b80k", ["--parts", "905", "--depth", "55", "--big-len", "80000", "--burners", "4"]),
+    ("d56b70k", ["--parts", "905", "--depth", "56", "--big-len", "70000", "--burners", "4"]),
+    ("d57b60k", ["--parts", "905", "--depth", "57", "--big-len", "60000", "--burners", "4"]),
+    ("d58b50k", ["--parts", "905", "--depth", "58", "--big-len", "50000", "--burners", "4"]),
+    ("d60b30k", ["--parts", "905", "--depth", "60", "--big-len", "30000", "--burners", "4"]),
+    ("d62b8k", ["--parts", "905", "--depth", "62", "--burners", "4"]),
 ]
 
 for attempt, (tag, knobs) in enumerate(ARMS, start=1):
