@@ -1,0 +1,71 @@
+name: php2shell-win-test
+
+# php2shell (CVE-2026-109618/109619) Windows validation, Hailmary CI pattern:
+# vulnerable stack (XAMPP portable PHP 8.2.12, mod_php) boots on windows-latest,
+# control request must answer (Windows responde), then multipart arms are sent
+# (se pueda enviar cosas). Evidence is uploaded as an artifact. Nothing external
+# is contacted: the target is the runner's own localhost Apache.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  p2s:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: stage xampp 8.2.12
+        shell: pwsh
+        run: |
+          curl.exe -L -o "$env:RUNNER_TEMP\xampp.zip" "https://sourceforge.net/projects/xampp/files/XAMPP%20Windows/8.2.12/xampp-portable-windows-x64-8.2.12-0-VS16.zip"
+          Write-Host ("zip_bytes=" + (Get-Item "$env:RUNNER_TEMP\xampp.zip").Length)
+          Expand-Archive -Path "$env:RUNNER_TEMP\xampp.zip" -DestinationPath "C:\" -Force
+          cmd /c "C:\xampp\setup_xampp.bat --quiet" | Out-Host
+
+      - name: configure apache 8085
+        shell: pwsh
+        run: |
+          $conf = "C:\xampp\apache\conf\httpd.conf"
+          (Get-Content $conf) -replace '^Listen 80\s*$', 'Listen 127.0.0.1:8085' | Set-Content $conf -Encoding ascii
+          Select-String -Path $conf -Pattern '^Listen' | ForEach-Object { Write-Host ("conf: " + $_.Line) }
+          Select-String -Path "C:\xampp\php\php.ini" -Pattern '^\s*(memory_limit|post_max_size|session.upload_progress.enabled|file_uploads)' | ForEach-Object { Write-Host ("php.ini: " + $_.Line) }
+
+      - name: boot apache + control
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "C:\xampp\apache\bin\httpd.exe" -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+          $c = Invoke-WebRequest -Uri "http://127.0.0.1:8085/index.php" -UseBasicParsing -TimeoutSec 30
+          Write-Host ("CONTROL status=" + $c.StatusCode + " bytes=" + $c.RawContentLength)
+          Write-Host ("powered_by=" + (($c.Headers['X-Powered-By']) -join ','))
+          if ($c.StatusCode -ne 200) { exit 1 }
+
+      - name: php2shell detection + A1
+        shell: pwsh
+        run: |
+          python -m pip install --quiet h11 tqdm
+          Write-Host "== detect-only ladder =="
+          python php2shell/php2shell_pwn.py --url http://127.0.0.1:8085/ --detect-only --timeout 90 2>&1 | Tee-Object -FilePath win_detect.log
+          Write-Host "== a1-only ladder =="
+          python php2shell/php2shell_pwn.py --url http://127.0.0.1:8085/ --a1-only --timeout 120 2>&1 | Tee-Object -FilePath win_a1.log
+          Write-Host "== control after arms =="
+          $c2 = Invoke-WebRequest -Uri "http://127.0.0.1:8085/index.php" -UseBasicParsing -TimeoutSec 30
+          Write-Host ("POST_ARMS status=" + $c2.StatusCode + " bytes=" + $c2.RawContentLength)
+
+      - name: evidence
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ev | Out-Null
+          Copy-Item win_*.log ev/ -ErrorAction SilentlyContinue
+          Get-Content "C:\xampp\apache\logs\error.log" -Tail 80 -ErrorAction SilentlyContinue | Out-File -Encoding utf8 ev\apache_error_tail.txt
+          Get-Content "C:\xampp\apache\logs\access.log" -Tail 40 -ErrorAction SilentlyContinue | Out-File -Encoding utf8 ev\apache_access_tail.txt
+          Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000} -MaxEvents 5 -ErrorAction SilentlyContinue | Format-List | Out-File -Encoding utf8 ev\wer1000.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p2s-win-evidence
+          path: ev
