@@ -29,6 +29,8 @@ def main() -> int:
     ap.add_argument("--fillers128", type=int, default=14)
     ap.add_argument("--big", type=int, default=78)
     ap.add_argument("--big-len", type=int, default=8000)
+    ap.add_argument("--bigs17", type=int, default=0)
+    ap.add_argument("--big-len17", type=int, default=0)
     ap.add_argument("--burners", type=int, default=20)
     ap.add_argument("--burner-len", type=int, default=4000)
     ap.add_argument("--progress-len", type=int, default=4000)
@@ -67,7 +69,8 @@ def main() -> int:
     for i in range(args.fillers128):
         part(("f%04d" % i).encode().ljust(103, b"x")[:103], b"v" * 8)
     for i in range(args.big):
-        part(("b%04d" % i).encode(), b"B" * args.big_len)
+        blen = args.big_len17 if (args.bigs17 and i < args.bigs17) else args.big_len
+        part(("b%04d" % i).encode(), b"B" * blen)
     for i in range(args.burners):
         part(("u%02d" % i).encode(), b"U" * args.burner_len)
     part(b"PHP_SESSION_UPLOAD_PROGRESS", b"k" * args.progress_len)
