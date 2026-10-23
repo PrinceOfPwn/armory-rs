@@ -43,16 +43,22 @@ def hist(dec):
     return total, mod, low
 
 ARMS = [
-    ("d58b635k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "63500",
+    ("b65k_u1k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
                   "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b640k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "64000",
-                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b645k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "64500",
-                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b650k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65000",
-                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b655k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
-                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
+    ("b65k_u2k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "2000"]),
+    ("b65k_u3k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "3000"]),
+    ("b65k_u5k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "5000"]),
+    ("b65k_u7k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "7000"]),
+    ("b65k_u9k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "9000"]),
+    ("b65k_u11k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                   "--fillers128", "4", "--burners", "30", "--burner-len", "11000"]),
+    ("b65k_u13k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                   "--fillers128", "4", "--burners", "30", "--burner-len", "13000"]),
 ]
 
 for attempt, (tag, knobs) in enumerate(ARMS, start=1):
