@@ -82,6 +82,7 @@ jobs:
           python php2shell/php2shell_pwn.py --url http://127.0.0.1:8085/ --a1-only --timeout 120 2>&1 | Tee-Object -FilePath win_a1.log
           Write-Host "== scanner-grade probes =="
           python php2shell/php2shell_scan.py -u http://127.0.0.1:8085/ -v --no-color 2>&1 | Tee-Object -FilePath win_scan.log
+          if ($LASTEXITCODE -eq 1) { Write-Host "scanner exit 1 = VULNERABLE found (expected)"; $global:LASTEXITCODE = 0 }
           Write-Host "== control after arms =="
           try {
             $c2 = Invoke-WebRequest -Uri "http://127.0.0.1:8085/index.php" -UseBasicParsing -TimeoutSec 30
