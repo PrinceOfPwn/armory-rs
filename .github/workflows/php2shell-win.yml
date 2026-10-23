@@ -44,7 +44,7 @@ jobs:
           Add-Content $ini 'extension_dir = "C:\xampp\php\ext"'
           Select-String -Path $ini -Pattern '^\s*(memory_limit|post_max_size|session.upload_progress.enabled|file_uploads)' | ForEach-Object { Write-Host ("php.ini: " + $_.Line) }
 
-      - name: boot apache + control
+      - name: boot apache + php2shell detection (single step)
         shell: pwsh
         run: |
           $bin = "C:\xampp\apache\bin\httpd.exe"
@@ -74,20 +74,20 @@ jobs:
           }
           $c = Invoke-WebRequest -Uri "http://127.0.0.1:8085/index.php" -UseBasicParsing -TimeoutSec 30
           Write-Host ("CONTROL status=" + $c.StatusCode + " bytes=" + $c.RawContentLength)
-          Write-Host ("powered_by=" + (($c.Headers['X-Powered-By']) -join ','))
           if ($c.StatusCode -ne 200) { exit 1 }
-
-      - name: php2shell detection + A1
-        shell: pwsh
-        run: |
           python -m pip install --quiet h11 tqdm
           Write-Host "== detect-only ladder =="
           python php2shell/php2shell_pwn.py --url http://127.0.0.1:8085/ --detect-only --timeout 90 2>&1 | Tee-Object -FilePath win_detect.log
           Write-Host "== a1-only ladder =="
           python php2shell/php2shell_pwn.py --url http://127.0.0.1:8085/ --a1-only --timeout 120 2>&1 | Tee-Object -FilePath win_a1.log
           Write-Host "== control after arms =="
-          $c2 = Invoke-WebRequest -Uri "http://127.0.0.1:8085/index.php" -UseBasicParsing -TimeoutSec 30
-          Write-Host ("POST_ARMS status=" + $c2.StatusCode + " bytes=" + $c2.RawContentLength)
+          try {
+            $c2 = Invoke-WebRequest -Uri "http://127.0.0.1:8085/index.php" -UseBasicParsing -TimeoutSec 30
+            Write-Host ("POST_ARMS status=" + $c2.StatusCode + " bytes=" + $c2.RawContentLength)
+          } catch {
+            Write-Host ("POST_ARMS FAILED: " + $_.Exception.Message + " (httpd alive=" + (-not $p.HasExited) + " exit=" + $p.ExitCode + ")")
+          }
+          Write-Host ("httpd_alive=" + (-not $p.HasExited))
 
       - name: evidence
         if: always()
