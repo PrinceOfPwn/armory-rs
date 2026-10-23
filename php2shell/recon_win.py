@@ -43,8 +43,11 @@ def hist(dec):
     return total, mod, low
 
 ARMS = [
-    ("a860", ["--parts", "860", "--depth", "64", "--big", "78"]),
+    ("a2000", ["--parts", "2000", "--depth", "62", "--big", "78"]),
+    ("a3000", ["--parts", "3000", "--depth", "62", "--big", "78"]),
+    ("a3400", ["--parts", "3400", "--depth", "62", "--big", "78"]),
     ("a4000", ["--parts", "4000", "--depth", "62", "--big", "78"]),
+    ("a4900", ["--parts", "4900", "--depth", "62", "--big", "78"]),
 ]
 
 for attempt, (tag, knobs) in enumerate(ARMS, start=1):
