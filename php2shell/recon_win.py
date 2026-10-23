@@ -43,17 +43,17 @@ def hist(dec):
     return total, mod, low
 
 ARMS = [
-    ("d59b39k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "39000",
+    ("d58b56k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "56000",
                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d59b42k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "42000",
+    ("d58b60k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "60000",
                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d59b45k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "45000",
+    ("d58b63k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "63000",
                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b71k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "71000",
+    ("d58b66k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "66000",
                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b74k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "74000",
+    ("d59b48k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "48000",
                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d60b64k", ["--parts", "890", "--depth", "60", "--big", "72", "--big-len", "64000",
+    ("d59b52k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "52000",
                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
 ]
 
