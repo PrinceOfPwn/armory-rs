@@ -37,9 +37,11 @@ jobs:
           Select-String -Path $conf -Pattern '^ServerRoot|^LoadModule php|^PHPIniDir|^DocumentRoot' | ForEach-Object { Write-Host ("paths: " + $_.Line) }
           Select-String -Path $conf -Pattern '^Listen|^#?Include conf/extra/httpd-ssl' | ForEach-Object { Write-Host ("conf: " + $_.Line) }
           $ini = "C:\xampp\php\php.ini"
+          (Get-Content $ini) -replace '"\\\\xampp', '"C:\\xampp' | ForEach-Object { $_ -replace '\\xampp', 'C:/xampp' } | Set-Content $ini -Encoding ascii
           (Get-Content $ini) -replace '^memory_limit\s*=.*', 'memory_limit = 128M' |
             ForEach-Object { $_ -replace '^post_max_size\s*=.*', 'post_max_size = 8M' } | Set-Content $ini -Encoding ascii
           Add-Content $ini "session.upload_progress.enabled = 1"
+          Add-Content $ini 'extension_dir = "C:\xampp\php\ext"'
           Select-String -Path $ini -Pattern '^\s*(memory_limit|post_max_size|session.upload_progress.enabled|file_uploads)' | ForEach-Object { Write-Host ("php.ini: " + $_.Line) }
 
       - name: boot apache + control
@@ -48,9 +50,10 @@ jobs:
           $bin = "C:\xampp\apache\bin\httpd.exe"
           Write-Host "== httpd -t =="
           & $bin -t 2>&1 | ForEach-Object { Write-Host ("t: " + $_) }
+          $env:PATH = "C:\xampp\php;C:\xampp\apache\bin;" + $env:PATH
           $err = "$env:RUNNER_TEMP\httpd_err.txt"
           $out = "$env:RUNNER_TEMP\httpd_out.txt"
-          $p = Start-Process -FilePath $bin -ArgumentList '-X' -WindowStyle Hidden -PassThru -RedirectStandardError $err -RedirectStandardOutput $out
+          $p = Start-Process -FilePath $bin -ArgumentList '-X' -WindowStyle Hidden -WorkingDirectory 'C:\xampp\apache\bin' -PassThru -RedirectStandardError $err -RedirectStandardOutput $out
           Start-Sleep -Seconds 6
           if ($p.HasExited) {
             Write-Host ("HTTPD EXITED code=" + $p.ExitCode)
