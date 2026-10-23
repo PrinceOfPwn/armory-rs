@@ -43,18 +43,16 @@ def hist(dec):
     return total, mod, low
 
 ARMS = [
-    ("d58b56k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "56000",
-                 "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b60k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "60000",
-                 "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b63k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "63000",
-                 "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d58b66k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "66000",
-                 "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d59b48k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "48000",
-                 "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
-    ("d59b52k", ["--parts", "890", "--depth", "59", "--big", "72", "--big-len", "52000",
-                 "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
+    ("d58b635k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "63500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
+    ("d58b640k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "64000",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
+    ("d58b645k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "64500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
+    ("d58b650k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65000",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
+    ("d58b655k", ["--parts", "890", "--depth", "58", "--big", "72", "--big-len", "65500",
+                  "--fillers128", "4", "--burners", "30", "--burner-len", "1000"]),
 ]
 
 for attempt, (tag, knobs) in enumerate(ARMS, start=1):
