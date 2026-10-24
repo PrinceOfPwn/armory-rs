@@ -1,0 +1,52 @@
+name: p2s-windows-ci
+on: [push, workflow_dispatch]
+jobs:
+  validate:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4.30', '7.4.33', '8.0.30', '8.2.12', '8.3.35']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          ini-values: memory_limit=8M, post_max_size=32M, session.upload_progress.enabled=1, display_errors=1, display_startup_errors=1, log_errors=1, error_log=php_errors.log
+      - name: Show PHP build
+        shell: pwsh
+        run: |
+          php -v
+          php -i | Select-String -Pattern 'memory_limit|post_max_size|upload_progress|Thread Safety|Architecture|Compiler' | ForEach-Object { $_.Line }
+      - name: Start PHP built-in server
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path docroot | Out-Null
+          Set-Content -Path docroot/index.php -Value "<?php echo 'P2S-OK ' . PHP_VERSION;"
+          $p = Start-Process -FilePath php -ArgumentList '-S','127.0.0.1:8080','-t','docroot' -PassThru -WindowStyle Hidden -RedirectStandardOutput php_server.log -RedirectStandardError php_server.err.log
+          $p.Id | Out-File server.pid
+          Start-Sleep -Seconds 3
+          try { (Invoke-WebRequest http://127.0.0.1:8080/ -UseBasicParsing).Content } catch { Write-Host $_.Exception.Message; exit 1 }
+      - name: Run php2shell harness
+        shell: pwsh
+        run: |
+          python p2s/windows_harness.py --php ${{ matrix.php }} --host 127.0.0.1 --port 8080 --arm-bytes 1800000 --out windows_result_${{ matrix.php }}.json
+          echo "HARNESS_RC=$LASTEXITCODE" >> $env:GITHUB_ENV
+      - name: Post-run state
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Content server.pid -ErrorAction SilentlyContinue | ForEach-Object { $proc = Get-Process -Id $_ -ErrorAction SilentlyContinue; if ($proc) { Write-Host "PHP server STILL ALIVE pid $_" } else { Write-Host 'PHP server DIED' } }
+          Get-Content windows_result_${{ matrix.php }}.json -ErrorAction SilentlyContinue
+          Get-Content php_server.err.log -Tail 40 -ErrorAction SilentlyContinue
+          Get-Content php_server.log -Tail 20 -ErrorAction SilentlyContinue
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2s-windows-${{ matrix.php }}
+          path: |
+            windows_result_*.json
+            php_server*.log
+            php_errors.log
+          if-no-files-found: ignore
